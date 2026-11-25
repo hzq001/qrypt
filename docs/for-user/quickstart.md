@@ -234,4 +234,4 @@ qrypt uninstall --purge --yes
 - 换成真实云盘（[支持的驱动列表](support-drivers.md)）——把 `type` 改为 `aliyundrive`、`quark`、`yun139`、`webdav`、`s3` 或 `baidu_netdisk`，并填写对应的认证参数
 - 用夸克网盘扫码登录（[夸克网盘扫码登录](quark-login.md)）——不用从浏览器复制 cookie
 - 了解其他配置项（[完整配置参考](full-config.md)）——缓存、带宽控制、日志等
-- 配置开机自动挂载
+- 配置开机自动挂载（[macOS launchd 教程](macos-autostart.md)）——登录后自动挂载，无需手动跑 `qrypt mount`

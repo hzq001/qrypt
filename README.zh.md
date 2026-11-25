@@ -122,6 +122,8 @@ qrypt mount
 - [用法问答](docs/for-user/faq.md) — 常见流程的参数写法，例如把离线下载结果放进加密目录
 - [完整配置参考](docs/for-user/full-config.md) — 全部配置项说明
 - [支持的驱动](docs/for-user/support-drivers.md) — 各云盘驱动的参数列表
+- [macOS 开机自动挂载](docs/for-user/macos-autostart.md) — 通过 launchd 登录后自动挂载
+- [macOS FSKit 挂载](docs/for-user/macos-fskit.md) — 在 macOS 26+ 使用 FUSE-T FSKit 后端
 
 ## 开发者文档
 
