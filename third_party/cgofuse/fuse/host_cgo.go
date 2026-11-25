@@ -213,7 +213,12 @@ static void *cgofuse_init_fuse(void)
 
 	void *h;
 #if defined(__APPLE__)
-	h = dlopen("/usr/local/lib/libfuse.2.dylib", RTLD_NOW); // MacFUSE/OSXFuse >= v4
+	// Prefer FUSE-T: macFUSE 5.4.0 only mounts through its FSKit backend unless
+	// the macFUSE kernel extension is approved, and that backend never delivers
+	// flush/release for write handles, so staged writes never commit.
+	h = dlopen("/usr/local/lib/libfuse-t.dylib", RTLD_NOW); // FUSE-T
+	if (0 == h)
+		h = dlopen("/usr/local/lib/libfuse.2.dylib", RTLD_NOW); // MacFUSE/OSXFuse >= v4
 	if (0 == h)
 		h = dlopen("/usr/local/lib/libosxfuse.2.dylib", RTLD_NOW); // MacFUSE/OSXFuse < v4
 	if (0 == h)
