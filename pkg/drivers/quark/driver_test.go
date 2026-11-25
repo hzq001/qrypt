@@ -2439,6 +2439,7 @@ func TestOssURLWithRealWorldExample(t *testing.T) {
 func routeOSSToTestServer(c *http.Client, server *httptest.Server) {
 	targetAddr := strings.TrimPrefix(server.URL, "https://")
 	baseTransport := c.Transport.(*http.Transport)
+	baseTransport.Proxy = nil
 	baseTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	baseDial := baseTransport.DialContext
 	baseTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
