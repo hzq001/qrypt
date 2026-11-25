@@ -127,7 +127,7 @@ cmd_status() {
   fi
   [ -f "$PLIST" ] && echo "plist: $PLIST"
   echo "mounts:"
-  mount | grep -iE "fuse-t:|macfuse:" || echo "  (none)"
+  mount | grep -iE "fuse-t:|macfuse:|\((fuse-t|macfuse)," || echo "  (none)"
 }
 
 case "${1:-}" in
