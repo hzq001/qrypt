@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,10 +27,9 @@ import (
 
 // reservedMountNames are subcommand names, so a mount cannot use them for the
 // `qrypt mount NAME` shorthand.
-// errMountSessionEnded reports that the FUSE session disappeared while the
-// command was still running, for example after an external unmount or a
-// kernel-initiated teardown of the mount.
-var errMountSessionEnded = errors.New("FUSE session ended unexpectedly (the volume may have been unmounted externally)")
+// errMountSessionEnded reports that the FUSE session ended unexpectedly while
+// the mount command was still running.
+var errMountSessionEnded = errors.New("FUSE session ended unexpectedly")
 
 var reservedMountNames = map[string]bool{
 	"add":    true,
@@ -59,6 +59,35 @@ func waitForMountStop(ctx context.Context, sessionDone <-chan struct{}) error {
 		}
 		return errMountSessionEnded
 	}
+}
+
+func awaitDirectMountStop(ctx context.Context, mountPoint string, sessionDone <-chan struct{}, sessionErr func() error, isMounted func(string) bool, unmount func(), errOut io.Writer) error {
+	if err := waitForMountStop(ctx, sessionDone); err != nil {
+		if isMounted != nil && !isMounted(mountPoint) {
+			// Something outside qrypt unmounted the volume (Finder eject,
+			// `diskutil unmount`, `umount`). That is the user's intent, not a
+			// failure: exit 0 so the service manager leaves it alone instead of
+			// remounting what the user just ejected.
+			logging.L.Infof("Unmounted externally: %s", mountPoint)
+			fmt.Fprintln(errOut, "Unmounted externally; exiting without remounting.")
+			unmount()
+			return nil
+		}
+		var cause error
+		if sessionErr != nil {
+			cause = sessionErr()
+		}
+		if cause != nil {
+			logging.L.Warnf("Mount stopped unexpectedly mount=%q err=%v cause=%v", mountPoint, err, cause)
+			fmt.Fprintf(errOut, "FUSE session ended unexpectedly: %v\n", cause)
+		} else {
+			logging.L.Warnf("Mount stopped unexpectedly: %v", err)
+		}
+		unmount()
+		return fmt.Errorf("%s: %w", mountPoint, err)
+	}
+	unmount()
+	return nil
 }
 
 func NewCommand(rt cliruntime.Runtime) *cobra.Command {
@@ -236,13 +265,7 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 			if prefetcher, ok := fs.(interface{ StartDirectoryPrefetch(context.Context) }); ok {
 				prefetcher.StartDirectoryPrefetch(ctx)
 			}
-			if err := waitForMountStop(ctx, session.Done()); err != nil {
-				logging.L.Warnf("Mount stopped unexpectedly: %v", err)
-				unmount()
-				return fmt.Errorf("%s: %w", mountPointExpanded, err)
-			}
-			unmount()
-			return nil
+			return awaitDirectMountStop(ctx, mountPointExpanded, session.Done(), session.Err, mount.IsMounted, unmount, cmd.ErrOrStderr())
 		},
 	}
 	rt.WithRuntimeConfigFlag(cmd)

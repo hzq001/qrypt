@@ -18,6 +18,23 @@ type mountServiceStub struct {
 	detachIDs   []string
 }
 
+type mountOutcomeServiceStub struct {
+	mountServiceStub
+	outcomes map[string]MountOutcome
+	err      error
+}
+
+func (s *mountOutcomeServiceStub) MountOutcome(_ context.Context, id string) (MountOutcome, error) {
+	if s.err != nil {
+		return MountOutcome{}, s.err
+	}
+	outcome, ok := s.outcomes[id]
+	if !ok {
+		return MountOutcome{}, errTest("mount \"" + id + "\" not found")
+	}
+	return outcome, nil
+}
+
 func (s *mountServiceStub) ListMounts(context.Context) ([]MountStatus, error) {
 	return s.mounts, nil
 }
@@ -105,6 +122,72 @@ func TestCommandServerMountDetach(t *testing.T) {
 	if resp.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("post status = %d, want 405", resp.Code)
 	}
+}
+
+func TestCommandServerMountOutcomeAndClient(t *testing.T) {
+	t.Parallel()
+	// Without MountOutcomeService, GET returns 501 unsupported.
+	bareServer := &CommandServer{mounts: &mountServiceStub{}}
+	resp := httptest.NewRecorder()
+	bareServer.handleMountByID(resp, httptest.NewRequest(http.MethodGet, "/v1/control/mounts/id-1", nil))
+	if resp.Code != http.StatusNotImplemented {
+		t.Fatalf("bare GET status = %d, want 501", resp.Code)
+	}
+
+	slashID := "/Users/me/Qrypt"
+	stub := &mountOutcomeServiceStub{
+		outcomes: map[string]MountOutcome{
+			"active":     {ID: "active", Active: true},
+			"detached":   {ID: "detached", Active: false, Reason: "detached"},
+			"external":   {ID: "external", Active: false, Reason: "external"},
+			"unexpected": {ID: "unexpected", Active: false, Reason: "unexpected", Error: "short read"},
+			slashID:      {ID: slashID, Active: false, Reason: "external"},
+		},
+	}
+	server := &CommandServer{mounts: stub}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/control/mounts/", server.handleMountByID)
+	httpSrv := httptest.NewServer(mux)
+	t.Cleanup(httpSrv.Close)
+
+	client, err := NewClient(httpSrv.URL)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ctx := context.Background()
+
+	for _, id := range []string{"active", "detached", "external", "unexpected", slashID} {
+		got, err := client.MountOutcome(ctx, id)
+		if err != nil {
+			t.Fatalf("MountOutcome(%q): %v", id, err)
+		}
+		want := stub.outcomes[id]
+		if got != want {
+			t.Fatalf("MountOutcome(%q) = %+v, want %+v", id, got, want)
+		}
+	}
+
+	if _, err := client.MountOutcome(ctx, "missing"); err == nil {
+		t.Fatal("MountOutcome(missing) succeeded, want 404")
+	} else {
+		var transport *TransportError
+		if !isTransportStatus(err, &transport, http.StatusNotFound) {
+			t.Fatalf("MountOutcome(missing) error = %v, want 404 TransportError", err)
+		}
+	}
+}
+
+func isTransportStatus(err error, target **TransportError, status int) bool {
+	if err == nil {
+		return false
+	}
+	t, ok := err.(*TransportError)
+	if !ok {
+		return false
+	}
+	*target = t
+	return t.Status == status
 }
 
 func TestCommandServerMountsUnavailable(t *testing.T) {

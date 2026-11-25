@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"context"
 	"io"
 	"path/filepath"
 	"strings"
@@ -62,7 +63,8 @@ func (a *adapter) Mknod(path string, mode uint32, dev uint64) int {
 		logFuseError("Mknod", path, errc, err)
 		return errc
 	}
-	return 0
+	errc = a.commitMutation(ctx, path)
+	return errc
 }
 
 func (a *adapter) Create(path string, flags int, mode uint32) (int, uint64) {
@@ -89,6 +91,9 @@ func (a *adapter) Create(path string, flags int, mode uint32) (int, uint64) {
 	if err := a.fs.Create(ctx, path); err != nil {
 		errc = fuseErr(err)
 		logFuseError("Create", path, errc, err)
+		return errc, 0
+	}
+	if errc = a.commitMutation(ctx, path); errc != 0 {
 		return errc, 0
 	}
 	if entry, err := a.fs.Stat(ctx, path); err == nil {
@@ -162,8 +167,29 @@ func (a *adapter) Write(path string, buff []byte, ofst int64, fh uint64) int {
 		logFuseError("Write", path, result, err)
 		return result
 	}
+	if n > 0 {
+		if result = a.commitMutation(ctx, path); result != 0 {
+			return result
+		}
+	}
 	result = n
 	return n
+}
+
+// FSKit can retain an open item after close(2) and omit the corresponding FUSE
+// Flush/Release. Commit each mutation before acknowledging it, so staged writes
+// enter the existing upload quiet window without waiting for those callbacks.
+// This syncs the local staging journal; uploading remains asynchronous.
+func (a *adapter) commitMutation(ctx context.Context, path string) int {
+	if !a.flushOnWrite {
+		return 0
+	}
+	if err := a.fs.Flush(ctx, path); err != nil {
+		errc := fuseErr(err)
+		logFuseError("Flush", path, errc, err)
+		return errc
+	}
+	return 0
 }
 
 func (a *adapter) Flush(path string, fh uint64) int {
@@ -219,7 +245,8 @@ func (a *adapter) Truncate(path string, size int64, fh uint64) int {
 		logFuseError("Truncate", path, errc, err)
 		return errc
 	}
-	return 0
+	errc = a.commitMutation(ctx, path)
+	return errc
 }
 
 func (a *adapter) Ftruncate(path string, size int64, fh uint64) int {

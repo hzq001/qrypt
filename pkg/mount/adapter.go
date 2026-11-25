@@ -20,26 +20,27 @@ import (
 
 type adapter struct {
 	fuse.FileSystemBase
-	fs         vfs.FileSystem
-	mu         sync.Mutex
-	ctx        context.Context
-	cancel     context.CancelFunc
-	handles    map[uint64]fuseHandle
-	xattrs     map[string]map[string][]byte
-	activeOps  [activeOpsSlots]activeOpsSlot
-	nextFH     uint64
-	nextOp     atomic.Uint64
-	stopping   atomic.Bool
-	ready      chan struct{}
-	readyOnce  sync.Once
-	trace      fuseTracer
-	statfs     StatfsOptions
-	statfsAuto statfsAutoCache
-	readOnly   bool
-	allowOther bool
-	credsOnce  sync.Once
-	cachedUID  uint32
-	cachedGID  uint32
+	fs           vfs.FileSystem
+	mu           sync.Mutex
+	ctx          context.Context
+	cancel       context.CancelFunc
+	handles      map[uint64]fuseHandle
+	xattrs       map[string]map[string][]byte
+	activeOps    [activeOpsSlots]activeOpsSlot
+	nextFH       uint64
+	nextOp       atomic.Uint64
+	stopping     atomic.Bool
+	ready        chan struct{}
+	readyOnce    sync.Once
+	trace        fuseTracer
+	statfs       StatfsOptions
+	statfsAuto   statfsAutoCache
+	readOnly     bool
+	allowOther   bool
+	flushOnWrite bool
+	credsOnce    sync.Once
+	cachedUID    uint32
+	cachedGID    uint32
 }
 
 // activeOpsSlots is the fixed capacity of the per-op active-operation ring.
@@ -166,25 +167,27 @@ func newAdapter(fs vfs.FileSystem, statfs StatfsOptions) *adapter {
 }
 
 type adapterOptions struct {
-	Statfs     StatfsOptions
-	ReadOnly   bool
-	AllowOther bool
+	Statfs       StatfsOptions
+	ReadOnly     bool
+	AllowOther   bool
+	FlushOnWrite bool
 }
 
 func newAdapterWithOptions(fs vfs.FileSystem, opts adapterOptions) *adapter {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &adapter{
-		fs:         fs,
-		ctx:        ctx,
-		cancel:     cancel,
-		ready:      make(chan struct{}),
-		handles:    map[uint64]fuseHandle{},
-		xattrs:     map[string]map[string][]byte{},
-		trace:      fuseTracer{},
-		statfs:     opts.Statfs,
-		statfsAuto: statfsAutoCache{},
-		readOnly:   opts.ReadOnly,
-		allowOther: opts.AllowOther,
+		fs:           fs,
+		ctx:          ctx,
+		cancel:       cancel,
+		ready:        make(chan struct{}),
+		handles:      map[uint64]fuseHandle{},
+		xattrs:       map[string]map[string][]byte{},
+		trace:        fuseTracer{},
+		statfs:       opts.Statfs,
+		statfsAuto:   statfsAutoCache{},
+		readOnly:     opts.ReadOnly,
+		allowOther:   opts.AllowOther,
+		flushOnWrite: opts.FlushOnWrite,
 	}
 }
 
@@ -465,7 +468,12 @@ func fillStatWithCreds(stat *fuse.Stat_t, entry drive.Entry, cachedUID, cachedGI
 	stat.Ino = stableInode(entry, path)
 	stat.Blksize = 4096
 	if entry.ModTime.IsZero() {
-		entry.ModTime = time.Now()
+		// Never fall back to time.Now(): every GETATTR would report a new
+		// mtime, the client treats the path as constantly changing and re-runs
+		// invalidation on it, and the macOS NFS kext panics on that path
+		// (docs/adr/0006-served-attributes-are-stable.md). The inode is stable
+		// per path, so it seeds a stable synthetic timestamp instead.
+		entry.ModTime = syntheticModTime(stat.Ino)
 	}
 	stat.Atim = fuse.NewTimespec(entry.ModTime)
 	stat.Mtim = stat.Atim
@@ -526,11 +534,21 @@ func fuseErr(err error) int {
 	return -fuse.EIO
 }
 
+// stableInode derives a file serial number from the virtual path. The path,
+// not drive.Entry.ID, is the identity: Entry.ID is the remote object ID for a
+// listed entry but the staging generation ID while an upload is pending, and
+// it changes again when the upload completes. Hashing it renumbers the inode
+// mid-write, which the NFS client answers with page-cache invalidation on a
+// vnode whose identity keeps shifting under a live writer — the macOS NFS kext
+// panics on that race (docs/adr/0006-served-attributes-are-stable.md).
+//
+// fallbackPath is empty only for callers that have no path at hand; then the
+// entry ID is the only available identity and is used with its churn intact.
 func stableInode(entry drive.Entry, fallbackPath string) uint64 {
 	h := fnv.New64a()
-	key := entry.ID
+	key := fallbackPath
 	if key == "" {
-		key = fallbackPath
+		key = entry.ID
 	}
 	if key == "" {
 		key = entry.Name
@@ -538,6 +556,20 @@ func stableInode(entry drive.Entry, fallbackPath string) uint64 {
 	h.Write([]byte(key))
 	return h.Sum64()
 }
+
+// syntheticModTime derives a fixed timestamp from an inode so entries without
+// a backend mtime still report one stable value per path. It spreads over a
+// year starting at 2000-01-01 to stay plausible without colliding on "now".
+func syntheticModTime(ino uint64) time.Time {
+	const base = 946684800 // 2000-01-01T00:00:00Z
+	return time.Unix(base+int64(ino%31536000), 0)
+}
+
+// slowOpThreshold bounds normal operation latency before logging a warning.
+// Network-backed cloud drives regularly take several hundred milliseconds for
+// remote metadata roundtrips, so 2 seconds catches true operational stalls
+// without spamming the error log on ordinary network roundtrips.
+const slowOpThreshold = 2 * time.Second
 
 func logFuseResult(op, path string, start time.Time, errc *int) {
 	if errc == nil {
@@ -548,7 +580,7 @@ func logFuseResult(op, path string, start time.Time, errc *int) {
 		logging.L.Warnf("[FUSE] %s path=%q errc=%d took=%v", op, path, *errc, elapsed)
 		return
 	}
-	if elapsed > 100*time.Millisecond {
+	if elapsed > slowOpThreshold {
 		logging.L.WarnfEvery("fuse.slow."+op, time.Second, "[FUSE] %s path=%q errc=%d took=%v (slow)", op, path, *errc, elapsed)
 		return
 	}

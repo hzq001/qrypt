@@ -178,15 +178,32 @@ func TestEnsureMountPointDetachesDeadMacFuseMount(t *testing.T) {
 		t.Fatalf("ensureMountPoint broke a live mount: %v\n%s", err, readLog(logPath))
 	}
 
-	// SIGKILL skips every unmount path, so the kernel keeps the mount entry.
+	// SIGKILL skips every unmount path.
 	if err := helper.Process.Kill(); err != nil {
 		t.Fatalf("kill helper: %v", err)
 	}
 	_ = helper.Wait()
-	waitForDeadMacFuseMount(t, mountPoint)
+
+	// What the kernel does with the entry afterwards depends on the backend.
+	//
+	// FUSE-T forks the go-nfsv4 helper as a child of the mounting process and
+	// reaps the mount with it: measured on macOS 27, the entry is gone from the
+	// mount table within a second, so there is nothing to recover and
+	// ensureMountPoint must simply succeed.
+	//
+	// macFUSE leaves the entry behind with a dead daemon, which is issue #10;
+	// that is the case ensureMountPoint has to detach.
+	if !mountPointStillMounted(t, mountPoint) {
+		t.Log("backend unmounted on process death; nothing to recover")
+		if err := ensureMountPoint(mountPoint); err != nil {
+			t.Fatalf("ensureMountPoint on a mount point the backend already released: %v", err)
+		}
+		assertEmptyDirectory(t, mountPoint)
+		return
+	}
 
 	if root, dead := deadFuseMountRoot(mountPoint); !dead {
-		t.Fatalf("dead macFUSE mount at %s was not detected", mountPoint)
+		t.Fatalf("dead mount at %s was not detected", mountPoint)
 	} else if root == "" {
 		t.Fatal("deadFuseMountRoot reported a dead mount without naming its root")
 	}
@@ -197,7 +214,27 @@ func TestEnsureMountPointDetachesDeadMacFuseMount(t *testing.T) {
 	if root, dead := deadFuseMountRoot(mountPoint); dead {
 		t.Fatalf("mount point %s is still hidden by the dead mount rooted at %s", mountPoint, root)
 	}
+	assertEmptyDirectory(t, mountPoint)
+}
 
+// mountPointStillMounted waits briefly for the kernel to settle after the helper
+// died, then reports whether the mount entry is still registered.
+func mountPointStillMounted(t *testing.T, mountPoint string) bool {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !mountedAt(mountPoint) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return true
+}
+
+// assertEmptyDirectory checks that mountPoint is the plain directory the test
+// created, with no mount hiding it.
+func assertEmptyDirectory(t *testing.T, mountPoint string) {
+	t.Helper()
 	info, err := os.Stat(mountPoint)
 	if err != nil {
 		t.Fatalf("stat mount point after recovery: %v", err)
@@ -297,18 +334,6 @@ func waitForMacFuseMount(t *testing.T, mountPoint, logPath string) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("helper never mounted %s:\n%s", mountPoint, readLog(logPath))
-}
-
-func waitForDeadMacFuseMount(t *testing.T, mountPoint string) {
-	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.ReadDir(mountPoint); isStaleMountError(err) {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("mount point %s did not become an unreachable mount after SIGKILL", mountPoint)
 }
 
 // macFuseReady reports whether the helper's filesystem is answering, which a

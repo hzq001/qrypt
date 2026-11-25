@@ -34,6 +34,22 @@ type MountService interface {
 	DetachMount(ctx context.Context, id string) error
 }
 
+// MountOutcome reports whether a hosted FUSE session is still active or why it
+// ended ("detached", "external", or "unexpected").
+type MountOutcome struct {
+	ID     string `json:"id"`
+	Active bool   `json:"active"`
+	Reason string `json:"reason,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// MountOutcomeService is an optional extension of MountService that lets
+// attached clients distinguish an external volume eject from an unexpected FUSE
+// session death after a mount leaves ListMounts.
+type MountOutcomeService interface {
+	MountOutcome(ctx context.Context, id string) (MountOutcome, error)
+}
+
 // SetMountService installs the mount service before Start.
 func (s *CommandServer) SetMountService(service MountService) {
 	s.mounts = service
@@ -77,24 +93,41 @@ func (s *CommandServer) handleMountByID(w http.ResponseWriter, r *http.Request) 
 		writeUnavailable(w, "mount service unavailable")
 		return
 	}
-	if r.Method != http.MethodDelete {
-		writeMethodNotAllowed(w)
-		return
-	}
 	id, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/v1/control/mounts/"))
 	if err != nil || id == "" {
 		writeBadRequest(w, "invalid mount id")
 		return
 	}
-	if err := s.mounts.DetachMount(r.Context(), id); err != nil {
-		status := http.StatusConflict
-		if strings.Contains(err.Error(), "not found") {
-			status = http.StatusNotFound
+	switch r.Method {
+	case http.MethodGet:
+		inspector, ok := s.mounts.(MountOutcomeService)
+		if !ok {
+			writeNotImplemented(w, "mount outcome query unsupported")
+			return
 		}
-		writeStatus(w, status, err.Error())
-		return
+		outcome, err := inspector.MountOutcome(r.Context(), id)
+		if err != nil {
+			status := http.StatusConflict
+			if strings.Contains(err.Error(), "not found") {
+				status = http.StatusNotFound
+			}
+			writeStatus(w, status, err.Error())
+			return
+		}
+		writeJSON(w, outcome)
+	case http.MethodDelete:
+		if err := s.mounts.DetachMount(r.Context(), id); err != nil {
+			status := http.StatusConflict
+			if strings.Contains(err.Error(), "not found") {
+				status = http.StatusNotFound
+			}
+			writeStatus(w, status, err.Error())
+			return
+		}
+		writeJSON(w, map[string]string{"id": id})
+	default:
+		writeMethodNotAllowed(w)
 	}
-	writeJSON(w, map[string]string{"id": id})
 }
 
 // ListMounts returns the FUSE sessions hosted by the Core behind this client.
@@ -129,4 +162,18 @@ func (c *Client) AttachMount(ctx context.Context, req MountAttachRequest) (Mount
 func (c *Client) DetachMount(ctx context.Context, id string) error {
 	_, err := c.Delete(ctx, "/v1/control/mounts/"+url.PathEscape(id))
 	return err
+}
+
+// MountOutcome queries whether a hosted mount session is still active or why it
+// ended.
+func (c *Client) MountOutcome(ctx context.Context, id string) (MountOutcome, error) {
+	body, err := c.Get(ctx, "/v1/control/mounts/"+url.PathEscape(id))
+	if err != nil {
+		return MountOutcome{}, err
+	}
+	var outcome MountOutcome
+	if err := json.Unmarshal(body, &outcome); err != nil {
+		return MountOutcome{}, err
+	}
+	return outcome, nil
 }

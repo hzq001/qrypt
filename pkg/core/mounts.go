@@ -42,6 +42,34 @@ type MountSession interface {
 	Done() <-chan struct{}
 }
 
+// MountSessionState is an optional extension of MountSession that reports why a
+// finished session stopped and whether the OS mount table still lists its mount
+// point. pkg/core reads it so the exit-reason bridge needs no pkg/mount import.
+type MountSessionState interface {
+	Err() error
+	IsMounted() bool
+}
+
+// MountEndReason classifies why a hosted FUSE session left the active table.
+type MountEndReason string
+
+const (
+	MountEndDetached   MountEndReason = "detached"
+	MountEndExternal   MountEndReason = "external"
+	MountEndUnexpected MountEndReason = "unexpected"
+)
+
+// EndedMount records the outcome of a finished hosted FUSE session.
+type EndedMount struct {
+	ID         string         `json:"id"`
+	MountPoint string         `json:"mount_point"`
+	Reason     MountEndReason `json:"reason"`
+	Error      string         `json:"error,omitempty"`
+	EndedAt    time.Time      `json:"ended_at"`
+}
+
+const maxEndedMounts = 64
+
 // MountHost mounts a filesystem view on the host. The desktop composition root
 // supplies the FUSE implementation. pkg/core must not import pkg/mount: that
 // would drag cgofuse into embedded builds such as the gomobile library.
@@ -60,18 +88,24 @@ type mountEntry struct {
 // registry happen under mu; Mount/Unmount calls happen outside it so a slow
 // mount never blocks listing.
 type mountManager struct {
-	mu     sync.Mutex
-	host   MountHost
-	mounts map[string]*mountEntry
-	closed bool
-	seq    uint64
+	mu         sync.Mutex
+	host       MountHost
+	mounts     map[string]*mountEntry
+	ended      map[string]EndedMount
+	endedOrder []string
+	closed     bool
+	seq        uint64
 }
 
 func newMountManager(host MountHost) *mountManager {
 	if host == nil {
 		return nil
 	}
-	return &mountManager{host: host, mounts: map[string]*mountEntry{}}
+	return &mountManager{
+		host:   host,
+		mounts: map[string]*mountEntry{},
+		ended:  map[string]EndedMount{},
+	}
 }
 
 func (m *mountManager) attach(ctx context.Context, fs vfs.FileSystem, req MountRequest) (HostedMount, error) {
@@ -131,6 +165,7 @@ func (m *mountManager) attach(ctx context.Context, fs vfs.FileSystem, req MountR
 		ReadOnly:   req.ReadOnly,
 		StartedAt:  time.Now().UTC(),
 	}
+	m.clearEndedLocked(id)
 	m.mounts[id] = &mountEntry{req: req, session: session, info: info}
 	m.mu.Unlock()
 
@@ -138,17 +173,72 @@ func (m *mountManager) attach(ctx context.Context, fs vfs.FileSystem, req MountR
 	return info, nil
 }
 
-// watch removes an entry when its FUSE session ends for any reason, so a
-// kernel-initiated unmount does not leave a phantom mount behind.
+func (m *mountManager) clearEndedLocked(id string) {
+	if _, ok := m.ended[id]; !ok {
+		return
+	}
+	delete(m.ended, id)
+	for i, existing := range m.endedOrder {
+		if existing == id {
+			m.endedOrder = append(m.endedOrder[:i], m.endedOrder[i+1:]...)
+			break
+		}
+	}
+}
+
+func (m *mountManager) recordEndedLocked(outcome EndedMount) {
+	if m.ended == nil {
+		m.ended = map[string]EndedMount{}
+	}
+	m.clearEndedLocked(outcome.ID)
+	m.ended[outcome.ID] = outcome
+	m.endedOrder = append(m.endedOrder, outcome.ID)
+	for len(m.endedOrder) > maxEndedMounts {
+		oldest := m.endedOrder[0]
+		m.endedOrder = m.endedOrder[1:]
+		delete(m.ended, oldest)
+	}
+}
+
+// watch removes an entry when its FUSE session ends outside detach/closeAll and
+// classifies whether the volume was unmounted externally or died unexpectedly.
 func (m *mountManager) watch(id string, session MountSession) {
 	done := session.Done()
 	if done == nil {
 		return
 	}
 	<-done
+
 	m.mu.Lock()
-	if entry, ok := m.mounts[id]; ok && entry.session == session {
+	entry, ok := m.mounts[id]
+	if !ok || entry.session != session {
+		m.mu.Unlock()
+		return
+	}
+	mountPoint := entry.info.MountPoint
+	m.mu.Unlock()
+
+	reason := MountEndUnexpected
+	errText := "FUSE session ended unexpectedly"
+	if state, hasState := session.(MountSessionState); hasState {
+		if !state.IsMounted() {
+			reason = MountEndExternal
+			errText = ""
+		} else if err := state.Err(); err != nil {
+			errText = err.Error()
+		}
+	}
+
+	m.mu.Lock()
+	if current, stillActive := m.mounts[id]; stillActive && current.session == session {
 		delete(m.mounts, id)
+		m.recordEndedLocked(EndedMount{
+			ID:         id,
+			MountPoint: mountPoint,
+			Reason:     reason,
+			Error:      errText,
+			EndedAt:    time.Now().UTC(),
+		})
 	}
 	m.mu.Unlock()
 }
@@ -164,6 +254,14 @@ func (m *mountManager) detach(ctx context.Context, id string) error {
 		return fmt.Errorf("core: mount %q not found", id)
 	}
 	delete(m.mounts, id)
+	// Record detached before Unmount closes session.Done so watch cannot
+	// overwrite an intentional detach with an external or unexpected outcome.
+	m.recordEndedLocked(EndedMount{
+		ID:         id,
+		MountPoint: entry.info.MountPoint,
+		Reason:     MountEndDetached,
+		EndedAt:    time.Now().UTC(),
+	})
 	m.mu.Unlock()
 	return m.host.Unmount(ctx, entry.session)
 }
@@ -189,8 +287,15 @@ func (m *mountManager) closeAll(ctx context.Context) {
 	m.mu.Lock()
 	m.closed = true
 	entries := make([]*mountEntry, 0, len(m.mounts))
-	for _, entry := range m.mounts {
+	now := time.Now().UTC()
+	for id, entry := range m.mounts {
 		entries = append(entries, entry)
+		m.recordEndedLocked(EndedMount{
+			ID:         id,
+			MountPoint: entry.info.MountPoint,
+			Reason:     MountEndDetached,
+			EndedAt:    now,
+		})
 	}
 	m.mounts = map[string]*mountEntry{}
 	m.mu.Unlock()
@@ -230,6 +335,48 @@ func (c *Core) DetachMount(ctx context.Context, id string) error {
 		return fmt.Errorf("core: closed")
 	}
 	return c.mounts.detach(ctx, id)
+}
+
+func (m *mountManager) endedOutcome(id string) (EndedMount, bool) {
+	if m == nil {
+		return EndedMount{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ended, ok := m.ended[id]
+	return ended, ok
+}
+
+func (m *mountManager) controlOutcome(id string) (control.MountOutcome, bool) {
+	if m == nil {
+		return control.MountOutcome{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry, ok := m.mounts[id]; ok {
+		return control.MountOutcome{
+			ID:     entry.info.ID,
+			Active: true,
+		}, true
+	}
+	if ended, ok := m.ended[id]; ok {
+		return control.MountOutcome{
+			ID:     ended.ID,
+			Active: false,
+			Reason: string(ended.Reason),
+			Error:  ended.Error,
+		}, true
+	}
+	return control.MountOutcome{}, false
+}
+
+// MountOutcome returns the recorded end state for a finished hosted mount, if
+// known. Active mounts and evicted entries return false.
+func (c *Core) MountOutcome(id string) (EndedMount, bool) {
+	if c == nil {
+		return EndedMount{}, false
+	}
+	return c.mounts.endedOutcome(id)
 }
 
 // ListMounts returns a snapshot of the hosted FUSE sessions.
@@ -284,4 +431,15 @@ func (s coreMountService) AttachMount(ctx context.Context, req control.MountAtta
 
 func (s coreMountService) DetachMount(ctx context.Context, id string) error {
 	return s.core.DetachMount(ctx, id)
+}
+
+func (s coreMountService) MountOutcome(_ context.Context, id string) (control.MountOutcome, error) {
+	if s.core == nil || s.core.mounts == nil {
+		return control.MountOutcome{}, fmt.Errorf("core: mount %q not found", id)
+	}
+	outcome, ok := s.core.mounts.controlOutcome(id)
+	if !ok {
+		return control.MountOutcome{}, fmt.Errorf("core: mount %q not found", id)
+	}
+	return outcome, nil
 }

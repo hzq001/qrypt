@@ -2,13 +2,17 @@
 
 本文档收录使用 qrypt 时可能遇到的常见问题。
 
+## macOS 读取挂载文件时整机重启
+
+如果系统崩溃报告包含 `com.apple.filesystems.nfs`，且 qrypt 的挂载类型是 `nfs`，可在 macOS 26 及以上[切换到 FUSE-T FSKit 后端](macos-fskit.md)，让这个挂载避开 NFS 客户端。仅升级 FUSE-T 不会改变已经运行的挂载后端。
+
 ## macOS 挂载点在慢速读取后消失
 
 macFUSE 默认对单个内核请求设置 60 秒的 `daemon_timeout`：请求超时后会自动弹出卷，日志中通常能看到 `[FUSE] Destroy`，随后访问挂载点会报 `Device not configured`。非会员网盘限速时，一次较大的读取或预取很容易超过这个时限。
 
 qrypt 默认向 macFUSE 传入 `daemon_timeout=0`，关闭内核的自动弹出，把超时和取消交给 qrypt 自己处理。如果配置文件中手动设置了 `[mount.options].darwin`，请不要额外配置较小的 `daemon_timeout`，否则仍可能触发自动卸载。
 
-自动卸载后，旧的 `qrypt mount` 进程可能仍在等待退出信号。新版 qrypt 会检测到 FUSE 会话结束并直接退出；旧版本可以先结束该进程，再按下文[挂载点残留](#挂载点残留)的方法清理残留挂载点。
+无论主动从 Finder / `diskutil unmount` 推出还是底层会话意外终止，`qrypt mount` 都会及时感知：若卷已从内核挂载表消失，说明是外部主动推出，进程以 0 退出且不自动重挂；若挂载点仍留在挂载表中但会话已死，进程以非零退出以便服务管理器（如 launchd）自动重启并按下文[挂载点残留](#挂载点残留)的方式清理。
 
 ## 挂载点残留
 

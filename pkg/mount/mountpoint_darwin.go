@@ -47,16 +47,21 @@ func detachHint(mountPoint string) string {
 	return "diskutil unmount force " + mountPoint
 }
 
-// statfsMount reports the canonical root and filesystem type of the mount that
-// covers path. macOS answers statfs(2) for a dead FUSE mount as well -- unlike
-// stat(2) it does not go through the daemon -- which is what makes the mount
-// root discoverable before anything is detached.
-func statfsMount(path string) (root, fsType string, ok bool) {
+// statfsMount reports the canonical root, filesystem type and mount source of
+// the mount that covers path. macOS answers statfs(2) for a dead FUSE mount as
+// well -- unlike stat(2) it does not go through the daemon -- which is what
+// makes the mount root discoverable before anything is detached.
+//
+// The source ("fuse-t:/Qrypt", "/dev/disk3s5") is needed on top of the type
+// because FUSE-T exports the filesystem as a localhost NFS mount: its type is
+// plain "nfs", indistinguishable from a network NFS mount, while the source
+// still names FUSE-T.
+func statfsMount(path string) (root, fsType, source string, ok bool) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
-		return "", "", false
+		return "", "", "", false
 	}
-	return cString(st.Mntonname[:]), cString(st.Fstypename[:]), true
+	return cString(st.Mntonname[:]), cString(st.Fstypename[:]), cString(st.Mntfromname[:]), true
 }
 
 // cString trims the NUL padding of a C char array, as returned in

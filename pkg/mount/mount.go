@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/winfsp/cgofuse/fuse"
@@ -52,7 +53,10 @@ type Session struct {
 	host                     *fuse.FileSystemHost
 	adapter                  *adapter
 	unsubscribeInvalidations func()
-	done                     chan struct{}
+
+	done    chan struct{}
+	endOnce sync.Once
+	endErr  error
 }
 
 // Done is closed when the underlying FUSE session ends. It covers an external
@@ -65,8 +69,53 @@ func (s *Session) Done() <-chan struct{} {
 	return s.done
 }
 
+// Err reports why the session ended. It is only meaningful after Done is
+// closed, and stays nil when the session ended without an error of its own
+// (for example the unmount this process requested itself).
+func (s *Session) Err() error {
+	if s == nil {
+		return nil
+	}
+	return s.endErr
+}
+
+// finish publishes the end of the session exactly once. The goroutine that
+// runs host.Mount is the only writer of endErr, and it publishes through the
+// close of done, so readers that observe Done see the matching endErr.
+func (s *Session) finish(err error) {
+	if s == nil || s.done == nil {
+		// A session without a done channel cannot be observed, so there is
+		// nothing to publish.
+		return
+	}
+	s.endOnce.Do(func() {
+		s.endErr = err
+		close(s.done)
+	})
+}
+
+// IsMounted reports whether mountPoint is still registered as a mount point.
+//
+// It separates the two ways a session can end while qrypt is alive. A session
+// that dies under a still-registered mount leaves a zombie the process manager
+// has to restart (the kernel keeps answering from a mount nobody serves). A
+// session whose mount is already gone was unmounted from outside qrypt --
+// Finder eject, `diskutil unmount`, `umount` -- which is a normal shutdown and
+// must not be reported as a failure, or the manager remounts what the user
+// just ejected.
+func IsMounted(mountPoint string) bool {
+	return mountedAt(mountPoint)
+}
+
 type Mounter interface {
+	// Mount exports fs at opts.MountPoint until ctx is canceled or the FUSE
+	// session ends. It returns a lifecycle handle, or an error for invalid
+	// arguments, an unusable mount point, or a failed FUSE startup. The caller
+	// retains ownership of fs and must observe Session.Done after startup.
 	Mount(ctx context.Context, fs vfs.FileSystem, opts Options) (*Session, error)
+	// Unmount stops new operations and detaches session's volume. A nil session
+	// is a no-op. ctx bounds waiting for a FSKit helper to release the mount;
+	// detach failures and an unfinished helper shutdown are returned as errors.
 	Unmount(ctx context.Context, session *Session) error
 }
 
@@ -102,8 +151,9 @@ func (FuseMounter) Mount(ctx context.Context, fs vfs.FileSystem, opts Options) (
 			TotalSpace: opts.TotalSpace,
 			FreeSpace:  opts.FreeSpace,
 		},
-		ReadOnly:   opts.ReadOnly,
-		AllowOther: opts.AllowOther,
+		ReadOnly:     opts.ReadOnly,
+		AllowOther:   opts.AllowOther,
+		FlushOnWrite: mountUsesFSKit(opts, runtime.GOOS),
 	})
 	host := fuse.NewFileSystemHost(ad)
 	// qrypt's adapter and VFS synchronize their mutable state internally, so
@@ -122,11 +172,16 @@ func (FuseMounter) Mount(ctx context.Context, fs vfs.FileSystem, opts Options) (
 	mountOpts := mountOptions(opts)
 	result := make(chan bool, 1)
 	go func() {
-		result <- host.Mount(opts.MountPoint, mountOpts)
+		ok := host.Mount(opts.MountPoint, mountOpts)
+		var endErr error
+		if !ok {
+			endErr = fmt.Errorf("mount: session for %s stopped serving", opts.MountPoint)
+		}
 		// The FUSE loop returns when the volume is unmounted or torn down by
 		// the kernel. Publish that to the owner so it does not keep running
 		// against a dead mount.
-		close(session.done)
+		session.finish(endErr)
+		result <- ok
 	}()
 	readyTimer := clock.After(opts.ReadyTimeout)
 
@@ -146,6 +201,11 @@ func (FuseMounter) Mount(ctx context.Context, fs vfs.FileSystem, opts Options) (
 	case <-ad.ready:
 		return session, nil
 	case <-readyTimer:
+		// The caller asked to be told when the mount is usable. It is not yet,
+		// which usually means the first metadata call into the backend is slow
+		// or stuck; keep the session (it may still become ready) but leave a
+		// trace so a hung mount is not mistaken for a healthy one.
+		logging.L.Warnf("[FUSE] mount not ready after %s mount=%q", opts.ReadyTimeout, opts.MountPoint)
 		return session, nil
 	}
 }
@@ -171,18 +231,63 @@ func (FuseMounter) Unmount(ctx context.Context, session *Session) error {
 	}
 	if cmd := unmountCommand(session.MountPoint); cmd != nil {
 		stepStart := time.Now()
-		if err := cmd.Run(); err != nil {
-			logging.L.Warnf("[FUSE] system unmount returned mount=%q dur=%s err=%v", session.MountPoint, time.Since(stepStart), err)
+		if !mountedAt(session.MountPoint) {
+			logging.L.Infof("[FUSE] system unmount skipped mount=%q reason=not mounted", session.MountPoint)
+		} else if err := forceUnmount(session.MountPoint); err != nil {
+			// The mount is still registered and every access to it will hang.
+			// Report it instead of pretending the session ended cleanly: the
+			// caller can then exit non-zero and the next start clears the
+			// leftover mount before mounting again.
+			logging.L.Warnf("[FUSE] system unmount failed mount=%q dur=%s err=%v", session.MountPoint, time.Since(stepStart), err)
+			return err
 		} else {
 			logging.L.Infof("[FUSE] system unmount complete mount=%q dur=%s", session.MountPoint, time.Since(stepStart))
+		}
+	}
+	if session.adapter != nil && session.adapter.flushOnWrite {
+		// FUSE-T may keep its FSKit helper alive for several seconds after the
+		// volume disappears. It rejects a new mount at the same path until the
+		// old helper exits, even though the mount table is already clear.
+		if err := waitForFuseTHelperExit(ctx, session.MountPoint); err != nil {
+			return err
 		}
 	}
 	logging.L.Infof("[FUSE] unmount complete mount=%q dur=%s", session.MountPoint, time.Since(start))
 	return nil
 }
 
+func waitForFuseTHelperExit(ctx context.Context, mountPoint string) error {
+	ctx, cancel := context.WithTimeout(ctx, detachTimeout)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for fuseTHelperAliveProbe(mountPoint) {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("mount: FUSE-T helper for %s has not stopped: %w", mountPoint, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	return nil
+}
+
 func mountOptions(opts Options) []string {
 	return mountOptionsForGOOS(opts, runtime.GOOS)
+}
+
+func mountUsesFSKit(opts Options, goos string) bool {
+	if goos != "darwin" {
+		return false
+	}
+	backend := ""
+	for _, option := range opts.PlatformOptions[goos] {
+		for part := range strings.SplitSeq(option, ",") {
+			if value, ok := strings.CutPrefix(part, "backend="); ok {
+				backend = value
+			}
+		}
+	}
+	return backend == "fskit"
 }
 
 func mountOptionsForGOOS(opts Options, goos string) []string {

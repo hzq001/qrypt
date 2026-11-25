@@ -20,6 +20,13 @@ type fuseMountSession struct {
 func (s fuseMountSession) ID() string            { return s.session.ID }
 func (s fuseMountSession) MountPoint() string    { return s.session.MountPoint }
 func (s fuseMountSession) Done() <-chan struct{} { return s.session.Done() }
+func (s fuseMountSession) Err() error            { return s.session.Err() }
+func (s fuseMountSession) IsMounted() bool {
+	if s.session == nil {
+		return false
+	}
+	return mount.IsMounted(s.session.MountPoint)
+}
 
 // fuseMountHost hosts FUSE sessions inside the resident Core process. Mount
 // options come from the Core's configuration; an attach request may only

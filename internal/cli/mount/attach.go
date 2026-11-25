@@ -2,7 +2,10 @@ package mount
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"sync"
 	"time"
 
@@ -14,6 +17,13 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/logging"
 	"github.com/yinzhenyu/qrypt/pkg/util"
 )
+
+const attachPollInterval = 2 * time.Second
+
+type attachMountClient interface {
+	ListMounts(ctx context.Context) ([]control.MountStatus, error)
+	MountOutcome(ctx context.Context, id string) (control.MountOutcome, error)
+}
 
 // runAttach asks the resident Core to host the FUSE session instead of opening
 // a second filesystem in this process. Ctrl+C detaches the session but leaves
@@ -68,7 +78,23 @@ func runAttach(rt cliruntime.Runtime, cmd *cobra.Command, state cliruntime.Confi
 	logging.L.Infof("Mounted at %s. Press Ctrl+C to unmount.", mountPoint)
 	fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", loc.T("out.mount.mounted", mountPoint))
 
-	ticker := time.NewTicker(2 * time.Second)
+	return watchAttachedMount(
+		ctx,
+		client,
+		info.ID,
+		mountPoint,
+		attachPollInterval,
+		detach,
+		func() { detachOnce.Do(func() {}) },
+		cmd.ErrOrStderr(),
+	)
+}
+
+func watchAttachedMount(ctx context.Context, client attachMountClient, id, mountPoint string, pollInterval time.Duration, detach, consumeDetach func(), errOut io.Writer) error {
+	if pollInterval <= 0 {
+		pollInterval = attachPollInterval
+	}
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -86,17 +112,53 @@ func runAttach(rt cliruntime.Runtime, cmd *cobra.Command, state cliruntime.Confi
 			}
 			found := false
 			for _, hosted := range mounts {
-				if hosted.ID == info.ID {
+				if hosted.ID == id {
 					found = true
 					break
 				}
 			}
 			if !found {
-				// Another client detached the volume (qrypt unmount); this is a
-				// normal end of the attach session, so consume detach and exit 0.
-				detachOnce.Do(func() {})
-				logging.L.Infof("Mount %s was detached by another client", mountPoint)
-				return nil
+				outcomeCtx, cancelOutcome := context.WithTimeout(context.Background(), 5*time.Second)
+				outcome, outcomeErr := client.MountOutcome(outcomeCtx, id)
+				cancelOutcome()
+				if outcomeErr != nil {
+					var transportErr *control.TransportError
+					if errors.As(outcomeErr, &transportErr) && (transportErr.Status == http.StatusNotFound || transportErr.Status == http.StatusNotImplemented) {
+						consumeDetach()
+						logging.L.Infof("Mount %s was detached by another client", mountPoint)
+						return nil
+					}
+					consumeDetach()
+					logging.L.Warnf("Mount outcome unavailable for %s: %v", mountPoint, outcomeErr)
+					return fmt.Errorf("%s: %w", mountPoint, errMountSessionEnded)
+				}
+				switch outcome.Reason {
+				case "external":
+					// Something outside qrypt ejected the volume (Finder eject,
+					// `diskutil unmount`, `umount`). Consume detach and exit 0 so
+					// launchd does not remount a volume the user just ejected.
+					consumeDetach()
+					logging.L.Infof("Unmounted externally: %s", mountPoint)
+					fmt.Fprintf(errOut, "Unmounted externally: %s\n", mountPoint)
+					return nil
+				case "unexpected":
+					// The FUSE session ended while the mount remained registered
+					// (or died with a session error). Consume detach so we do not
+					// try to detach a dead session again, and return non-zero so
+					// a service manager can restart and clear the stale mount.
+					consumeDetach()
+					logging.L.Warnf("FUSE session ended unexpectedly mount=%q err=%s", mountPoint, outcome.Error)
+					if outcome.Error != "" {
+						fmt.Fprintf(errOut, "FUSE session ended unexpectedly: %s\n", outcome.Error)
+					}
+					return fmt.Errorf("%s: %w", mountPoint, errMountSessionEnded)
+				default:
+					// Another client detached the volume (qrypt unmount); this is a
+					// normal end of the attach session, so consume detach and exit 0.
+					consumeDetach()
+					logging.L.Infof("Mount %s was detached by another client", mountPoint)
+					return nil
+				}
 			}
 		}
 	}

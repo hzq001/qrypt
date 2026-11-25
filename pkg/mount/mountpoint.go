@@ -97,9 +97,22 @@ func deadFuseMountRoot(path string) (string, bool) {
 
 // deadFuseMountRootWithClock is deadFuseMountRoot with the probe's time seam.
 func deadFuseMountRootWithClock(path string, clock testclock.Clock) (string, bool) {
-	root, ok := fuseMountRoot(path)
+	root, fuseT, ok := fuseMountInfo(path)
 	if !ok {
 		return "", false
+	}
+	if fuseT {
+		// FUSE-T serves the mount from a helper process it forks and reaps
+		// together with the mounting process. When that helper is gone the
+		// mount cannot answer again, and its probe does not report an errno
+		// that proves it: a dead FUSE-T mount answers readdir with EIO -- the
+		// same errno a live mount returns when a backend call fails -- or
+		// blocks until the NFS client gives up. Helper liveness is the
+		// reliable signal, and it is cheap: no mount operation is involved.
+		if fuseTHelperAliveProbe(root) {
+			return "", false
+		}
+		return root, true
 	}
 	if !isDeadDaemonError(probeMountDaemonWithClock(path, clock)) {
 		// The daemon answered (or did not answer in time): the mount is usable
@@ -153,18 +166,48 @@ func DetachMount(path string) error {
 // fuseMountRoot returns the canonical root of the FUSE filesystem that contains
 // path when the platform can report it (macOS does; see statfsMount).
 func fuseMountRoot(path string) (string, bool) {
-	root, fsType, ok := statfsMount(path)
-	if !ok || root == "" || !isFuseFilesystem(fsType) {
-		return "", false
-	}
-	return root, true
+	root, _, ok := fuseMountInfo(path)
+	return root, ok
 }
 
-// isFuseFilesystem reports whether a statfs(2) filesystem type name belongs to a
-// FUSE implementation. The name is platform specific ("macfuse", "osxfuse",
-// "fuse.qrypt", "fuseblk", ...), so match on the shared part.
-func isFuseFilesystem(fsType string) bool {
-	return strings.Contains(strings.ToLower(fsType), "fuse")
+// statfsMountProbe is the statfs(2) reading fuseMountInfo uses. It is a variable
+// so tests can describe a mount (a FUSE-T mount over NFS, for instance) without
+// creating one: FUSE-T reaps its mount when the mounting process dies, so the
+// orphaned-mount case cannot be produced on a real machine.
+var statfsMountProbe = statfsMount
+
+// fuseMountInfo reports the mount root covering path and whether that mount is
+// served by FUSE-T specifically. Callers that only need "is this a FUSE mount"
+// use fuseMountRoot; the session-death check needs the FUSE-T distinction
+// because FUSE-T's liveness signal is its helper process, not a probe errno.
+func fuseMountInfo(path string) (root string, fuseT bool, ok bool) {
+	root, fsType, source, statOK := statfsMountProbe(path)
+	if !statOK || root == "" || !isFuseFilesystem(fsType, source) {
+		return "", false, false
+	}
+	// The FSKit backend reports type "fuse-t" and a file:// session descriptor
+	// as its source. It still has a per-mount go-nfsv4 helper.
+	return root, strings.EqualFold(fsType, "fuse-t") || isFuseTMount(source), true
+}
+
+// isFuseTMount reports whether a mount source belongs to FUSE-T. FUSE-T exports
+// the filesystem as a localhost NFS mount, so its source is the only field that
+// names it ("fuse-t:/Qrypt").
+func isFuseTMount(source string) bool {
+	return strings.Contains(strings.ToLower(source), "fuse-t")
+}
+
+// isFuseFilesystem reports whether a mount belongs to a FUSE implementation.
+//
+// The filesystem type alone is not enough. macFUSE, osxfuse and Linux FUSE
+// export a name that contains "fuse" ("macfuse", "osxfuse", "fuse.qrypt",
+// "fuseblk"), but FUSE-T exports the filesystem as a localhost NFS mount, so
+// its type is plain "nfs" -- indistinguishable from a network NFS mount -- while
+// its mount source keeps naming FUSE-T ("fuse-t:/Qrypt"). Matching the source
+// as well is what lets stale-mount recovery see a FUSE-T mount at all; without
+// it a killed FUSE-T mount is never recognised and the next mount fails on it.
+func isFuseFilesystem(fsType, source string) bool {
+	return strings.Contains(strings.ToLower(fsType), "fuse") || isFuseTMount(source)
 }
 
 // probeMountDaemonWithClock asks the FUSE server behind dir whether it is still
@@ -172,29 +215,31 @@ func isFuseFilesystem(fsType string) bool {
 // dead", either because the daemon answered or because it did not answer in
 // time.
 func probeMountDaemonWithClock(dir string, clock testclock.Clock) error {
-	return boundedProbe(clock, mountProbeTimeout, func() error {
+	_, err := boundedProbe(clock, mountProbeTimeout, func() error {
 		// A directory read is the cheapest call that reaches the daemon instead
 		// of being served from the dead mount's cached root inode.
 		_, err := os.ReadDir(dir)
 		return err
 	})
+	return err
 }
 
-// boundedProbe runs probe and gives up after timeout, reporting nil -- the
-// inconclusive answer -- so a caller that reads nil as "alive" stays
+// boundedProbe runs probe and reports whether it finished before the timeout,
+// plus its result. A probe that did not answer in time comes back as
+// (false, nil): "not provably dead", so a caller reading nil as "alive" stays
 // conservative. The probe goroutine is left to finish on its own if it ever
 // does; the alternative is blocking a mount for as long as a hung FUSE daemon
 // takes to answer.
-func boundedProbe(clock testclock.Clock, timeout time.Duration, probe func() error) error {
+func boundedProbe(clock testclock.Clock, timeout time.Duration, probe func() error) (bool, error) {
 	done := make(chan error, 1)
 	go func() {
 		done <- probe()
 	}()
 	select {
 	case err := <-done:
-		return err
+		return true, err
 	case <-clock.After(timeout):
-		return nil
+		return false, nil
 	}
 }
 

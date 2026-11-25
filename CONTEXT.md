@@ -99,6 +99,10 @@ _Avoid_: path、filepath
 配置了但初始化失败、被排除出命名空间的挂载。命名空间照常打开，失败原因单独上报。
 _Avoid_: error
 
+**Mount Session（挂载会话）**:
+一次挂载进程（Resident Core 或 `--isolated`）内的 FUSE 导出会话，由 `Mounter.Mount` 返回。会话结束时 `Session.Done()` 关闭，并通过内核挂载表与 `MountOutcome` 区分主动卸载（`detached`）、外部推出（`external`）与意外死亡（`unexpected`）：只有挂载仍在挂载表中且非主动卸载时才以非零码请求重启，不能在同一会话内恢复。
+_Avoid_: connection、服务端
+
 ### 本地视图与可见性
 
 **View（本地视图）**:
