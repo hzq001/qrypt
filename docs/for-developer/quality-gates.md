@@ -466,6 +466,21 @@ pwsh ./scripts/install/smoke-install.ps1   # Windows 安装脚本端到端冒烟
 不一致时 CI 失败（PowerShell 侧在 Windows 任务或任何装有 `pwsh` 的环境运行）。
 `smoke-install.ps1` 在 `test-windows` 任务中运行。
 
+### 受限本地环境
+
+macOS 上直接运行 Go、文档生成器和质量工具时，各工具默认写入用户缓存目录。
+若当前环境只允许写入工作区和临时目录，除配合下文「临时目录与残留挂载」说明的
+`GOCACHE` 外，还可在同一 shell 中设置：
+
+```bash
+export STATICCHECK_CACHE="${TMPDIR:-/tmp}/qrypt-staticcheck-cache"
+export GOLANGCI_LINT_CACHE="${TMPDIR:-/tmp}/qrypt-golangci-cache"
+```
+
+这些变量只调整构建与静态检查缓存，不能解决模块下载缓存、`~/.qrypt/run`、Git 元数据
+或真实挂载的权限限制。遇到对应的拒绝访问时，应报告完整 CI 仍被阻塞；
+不要把定向测试通过或跳过真实挂载测试当作完整门禁通过。
+
 ## 测试并行度
 
 除少数例外，测试都带 `t.Parallel()`。`pkg/core` 并行后 8.2s → 2.8s。测试耗时
