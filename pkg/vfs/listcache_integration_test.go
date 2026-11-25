@@ -2,6 +2,8 @@ package vfs
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -107,5 +109,118 @@ func TestVFSListCacheServesSecondListingAndSurvivesRestart(t *testing.T) {
 		if err := f.CloseReadCache(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+type extraRequiringDriver struct {
+	drive.Driver
+	rootID string
+	lists  *atomic.Int64
+}
+
+func (d *extraRequiringDriver) List(ctx context.Context, parentID string) ([]drive.Entry, error) {
+	if d.lists != nil && parentID == d.rootID {
+		d.lists.Add(1)
+	}
+	entries, err := d.Driver.List(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range entries {
+		if entries[i].IsDir {
+			continue
+		}
+		entries[i].Extra = map[string]any{
+			"fs_id": "42",
+			"md5":   "abc",
+		}
+	}
+	return entries, nil
+}
+
+func (d *extraRequiringDriver) Read(ctx context.Context, entry drive.Entry, offset, size int64) (io.ReadCloser, error) {
+	extra, ok := drive.EntryRawExtra(entry).(map[string]any)
+	if !ok || extra["fs_id"] != "42" {
+		return nil, fmt.Errorf("missing fs_id for %q (extra=%#v)", entry.ID, entry.Extra)
+	}
+	return d.Driver.Read(ctx, entry, offset, size)
+}
+
+func TestVFSListCachePreservesEntryExtraAcrossRestart(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cacheDir := filepath.Join(t.TempDir(), "m")
+	ctx := context.Background()
+
+	var firstLists atomic.Int64
+	fs1, err := New(&extraRequiringDriver{Driver: localfs.New(root), rootID: "0", lists: &firstLists}, Options{
+		Name:              "m",
+		StorageDir:        t.TempDir(),
+		ListCacheDir:      cacheDir,
+		ListCacheTTL:      time.Minute,
+		ListCacheMaxBytes: 1 << 20,
+		ListCacheIdentity: "identity-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := fs1.CloseReadCache(); err != nil {
+			t.Errorf("fs1.CloseReadCache: %v", err)
+		}
+	})
+
+	if _, err := fs1.List(ctx, "/"); err != nil {
+		t.Fatalf("fs1.List: %v", err)
+	}
+	if firstLists.Load() != 1 {
+		t.Fatalf("fs1 lists = %d, want 1", firstLists.Load())
+	}
+
+	var restartLists atomic.Int64
+	fs2, err := New(&extraRequiringDriver{Driver: localfs.New(root), rootID: "0", lists: &restartLists}, Options{
+		Name:              "m",
+		StorageDir:        t.TempDir(),
+		ListCacheDir:      cacheDir,
+		ListCacheTTL:      time.Minute,
+		ListCacheMaxBytes: 1 << 20,
+		ListCacheIdentity: "identity-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := fs2.CloseReadCache(); err != nil {
+			t.Errorf("fs2.CloseReadCache: %v", err)
+		}
+	})
+
+	entries, err := fs2.List(ctx, "/")
+	if err != nil {
+		t.Fatalf("fs2.List: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "a.txt" {
+		t.Fatalf("fs2 entries = %+v", entries)
+	}
+	if restartLists.Load() != 0 {
+		t.Fatalf("restart lists = %d, want 0", restartLists.Load())
+	}
+
+	rc, err := fs2.Read(ctx, "/a.txt", 0, 1)
+	if err != nil {
+		t.Fatalf("fs2.Read: %v", err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("io.ReadAll: %v", err)
+	}
+	if string(data) != "a" {
+		t.Fatalf("data = %q, want %q", string(data), "a")
+	}
+	if restartLists.Load() != 0 {
+		t.Fatalf("restart lists after Read = %d, want 0", restartLists.Load())
 	}
 }

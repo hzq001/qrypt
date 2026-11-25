@@ -11,10 +11,11 @@
 // the A-lists / B-renames / A-writes-old-list race: a fetch that started
 // before a mutation is discarded instead of persisted.
 //
-// Entries are the raw remote listing; the provider-side remote name is stored
-// alongside each entry because drive.Entry.Extra is not serializable. Local pending uploads, rename shadows
-// and delayed deletes are projected on top by the view at read time; the file
-// never contains them.
+// Entries are the raw remote listing; the provider-side remote name and
+// JSON-serializable map Extra metadata (such as baidunetdisk fs_id) are stored
+// alongside each entry because drive.Entry.Extra carries json:"-". Local pending
+// uploads, rename shadows and delayed deletes are projected on top by the view
+// at read time; the file never contains them.
 package listcache
 
 import (
@@ -36,7 +37,7 @@ import (
 
 const (
 	// SchemaVersion is bumped when the on-disk shape changes incompatibly.
-	SchemaVersion = 1
+	SchemaVersion = 2
 	// DefaultTTL is how long a persisted listing may be served.
 	DefaultTTL = 30 * time.Second
 	// DefaultMaxBytes caps one mount's persisted listings.
@@ -106,11 +107,13 @@ type fileFormat struct {
 	Entries    []storedEntry `json:"entries"`
 }
 
-// storedEntry augments a drive.Entry with the provider-side remote name,
-// which lives in the non-serializable Extra field in memory.
+// storedEntry augments a drive.Entry with the provider-side remote name and
+// JSON-serializable map Extra metadata, which live in the json:"-" Extra
+// field in memory.
 type storedEntry struct {
 	drive.Entry
-	RemoteName string `json:"remote_name,omitempty"`
+	RemoteName string         `json:"remote_name,omitempty"`
+	Extra      map[string]any `json:"extra,omitempty"`
 }
 
 func encodeEntries(entries []drive.Entry) []storedEntry {
@@ -120,15 +123,54 @@ func encodeEntries(entries []drive.Entry) []storedEntry {
 		if remote == entry.Name {
 			remote = ""
 		}
-		out[i] = storedEntry{Entry: entry, RemoteName: remote}
+		out[i] = storedEntry{
+			Entry:      entry,
+			RemoteName: remote,
+			Extra:      extractExtraMap(entry.Extra),
+		}
 	}
 	return out
+}
+
+func extractExtraMap(extra any) map[string]any {
+	for range 8 {
+		wrapper, ok := extra.(drive.EntryRawExtraer)
+		if !ok {
+			break
+		}
+		next := wrapper.EntryRawExtra()
+		if next == nil {
+			return nil
+		}
+		extra = next
+	}
+	m, ok := extra.(map[string]any)
+	if !ok || len(m) == 0 {
+		return nil
+	}
+	if _, err := json.Marshal(m); err == nil {
+		return m
+	}
+	filtered := make(map[string]any, len(m))
+	for k, v := range m {
+		if _, err := json.Marshal(v); err == nil {
+			filtered[k] = v
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
 }
 
 func decodeEntries(entries []storedEntry) []drive.Entry {
 	out := make([]drive.Entry, len(entries))
 	for i, stored := range entries {
-		out[i] = drive.WrapRemoteName(stored.Entry, stored.RemoteName)
+		entry := stored.Entry
+		if len(stored.Extra) > 0 {
+			entry.Extra = stored.Extra
+		}
+		out[i] = drive.WrapRemoteName(entry, stored.RemoteName)
 	}
 	return out
 }

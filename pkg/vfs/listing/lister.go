@@ -165,6 +165,12 @@ func decodeListPageCursor(cursor string) (listPageCursor, bool) {
 // ListNoPrefetch lists a directory without scheduling prefetch.
 func (l *Lister) ListNoPrefetch(ctx context.Context, path string) ([]drive.Entry, error) {
 	path = CleanVirtualPath(path)
+	if l.view.IsUnavailable(path) {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, path)
+	}
+	if entries, ok := l.view.FreshListCache(path, time.Now()); ok {
+		return entries, nil
+	}
 	if entries, ok := l.cachedChildren(path); ok {
 		return entries, nil
 	}
@@ -218,10 +224,10 @@ func (l *Lister) listChildrenWithMode(ctx context.Context, parentPath, parentID 
 			return nil, fmt.Errorf("%w: %s", ErrNotFound, parentPath)
 		}
 		now := time.Now()
-		if entries, ok := l.cachedChildren(parentPath); ok {
+		if entries, ok := l.view.FreshListCache(parentPath, now); ok {
 			return entries, nil
 		}
-		if entries, ok := l.view.FreshListCache(parentPath, now); ok {
+		if entries, ok := l.cachedChildren(parentPath); ok {
 			return entries, nil
 		}
 

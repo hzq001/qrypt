@@ -101,3 +101,66 @@ func TestListerServesPersistedListingWithoutRemoteCalls(t *testing.T) {
 		t.Fatalf("put generation = %d, want 1", cache.putGen)
 	}
 }
+
+func TestListerPrefersInMemoryFreshListBeforePersistedCache(t *testing.T) {
+	type customExtra struct {
+		Tag string
+	}
+	memEntries := []drive.Entry{{
+		ID:    "a",
+		Name:  "a.txt",
+		Size:  1,
+		Extra: customExtra{Tag: "in-memory"},
+	}}
+	host := &cacheHost{
+		fakeRuntimeHost: &fakeRuntimeHost{
+			stubHost: stubHost{
+				cache: map[string]listCacheEntry{
+					"/dir": {
+						entries: memEntries,
+						expires: time.Now().Add(time.Minute),
+					},
+				},
+			},
+		},
+	}
+	cache := &fakeListCache{
+		entries: map[string][]drive.Entry{
+			"/dir": {{ID: "a", Name: "a.txt", Size: 1}},
+		},
+	}
+	lister := NewLister(ListerDeps{Remote: host, View: host, State: NewState(), ListCache: cache})
+	ctx := context.Background()
+
+	got, err := lister.ListNoPrefetch(ctx, "/dir")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("ListNoPrefetch = %v, %v", got, err)
+	}
+	if cache.gets != 0 {
+		t.Fatalf("ListNoPrefetch consulted persisted cache (%d gets) while in-memory list was fresh", cache.gets)
+	}
+	if extra, ok := got[0].Extra.(customExtra); !ok || extra.Tag != "in-memory" {
+		t.Fatalf("ListNoPrefetch extra = %#v, want in-memory customExtra", got[0].Extra)
+	}
+
+	got, err = lister.Children(ctx, "/dir", "dir-id")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Children = %v, %v", got, err)
+	}
+	if cache.gets != 0 {
+		t.Fatalf("Children consulted persisted cache (%d gets) while in-memory list was fresh", cache.gets)
+	}
+	if extra, ok := got[0].Extra.(customExtra); !ok || extra.Tag != "in-memory" {
+		t.Fatalf("Children extra = %#v, want in-memory customExtra", got[0].Extra)
+	}
+
+	// Once in-memory cache expires or disappears, fall back to persisted ListCache.
+	host.cache = nil
+	got, err = lister.ListNoPrefetch(ctx, "/dir")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("cold ListNoPrefetch = %v, %v", got, err)
+	}
+	if cache.gets == 0 {
+		t.Fatalf("expected persisted cache fallback after in-memory eviction, gets = %d", cache.gets)
+	}
+}
