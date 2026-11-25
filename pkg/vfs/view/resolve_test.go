@@ -21,6 +21,8 @@ func (r *fakeResolver) CachedEntry(path string) (drive.Entry, bool) {
 	return entry, ok
 }
 
+func (*fakeResolver) MissingFromFreshList(string) bool { return false }
+
 func (r *fakeResolver) CommitResolvedChildren(_ string, name string, entries []drive.Entry) (drive.Entry, bool) {
 	r.committed = CloneEntries(entries)
 	for _, entry := range entries {

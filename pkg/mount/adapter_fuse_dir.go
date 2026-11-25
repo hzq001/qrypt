@@ -13,19 +13,23 @@ func (a *adapter) Readdir(path string, fill func(name string, stat *fuse.Stat_t,
 	defer func() {
 		a.trace.log("Readdir", path, "fh=%d ofst=%d count=%d err=%d dur=%s", fh, ofst, count, errc, time.Since(start))
 	}()
-	ctx, done, ok := a.beginOp("Readdir", path)
+	ctx, done, ok := a.beginMetadataOp("Readdir", path)
 	if !ok {
 		errc = -fuse.EIO
 		return errc
 	}
 	defer done()
-	fill(".", nil, 0)
-	fill("..", nil, 0)
+	if ofst > 0 {
+		return 0
+	}
 	entries, err := a.fs.List(ctx, path)
 	if err != nil {
 		errc = fuseErr(err)
 		logFuseError("Readdir", path, errc, err)
 		return errc
+	}
+	if !fill(".", nil, 0) || !fill("..", nil, 0) {
+		return 0
 	}
 	for _, entry := range entries {
 		st := &fuse.Stat_t{}
@@ -46,7 +50,7 @@ func (a *adapter) Opendir(path string) (int, uint64) {
 	errc := 0
 	var fh uint64
 	defer func() { a.trace.log("Opendir", path, "fh=%d err=%d dur=%s", fh, errc, time.Since(start)) }()
-	ctx, done, ok := a.beginOp("Opendir", path)
+	ctx, done, ok := a.beginMetadataOp("Opendir", path)
 	if !ok {
 		errc = -fuse.EIO
 		return errc, 0

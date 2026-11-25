@@ -14,6 +14,10 @@ import (
 // visibility checks.
 type resolver interface {
 	CachedEntry(path string) (drive.Entry, bool)
+	// MissingFromFreshList reports whether an unexpired complete parent
+	// listing proves path absent. It returns false for an unknown or expired
+	// listing and for a child that has a locally cached entry. No remote IO.
+	MissingFromFreshList(path string) bool
 	CommitResolvedChildren(parentPath, name string, entries []drive.Entry) (drive.Entry, bool)
 	IsUnavailable(path string) bool
 	IsRecentLocalDir(path string) bool
@@ -35,6 +39,30 @@ func NewResolve(view *View, overlay *Overlay) Resolve {
 // CachedEntry returns the cached entry identity for path.
 func (r Resolve) CachedEntry(path string) (drive.Entry, bool) {
 	return r.view.entries.Get(vfstypes.CleanVirtualPath(path))
+}
+
+// MissingFromFreshList checks the existing parent listing without cloning or
+// projecting the whole effective directory. Missing-file probes are common
+// during background scans; projecting each one also scans every cached entry
+// to merge local children, even when the parent already proves absence.
+func (r Resolve) MissingFromFreshList(path string) bool {
+	path = vfstypes.CleanVirtualPath(path)
+	name, parentPath := vfstypes.SplitVirtualPath(path)
+	r.view.mu.RLock()
+	defer r.view.mu.RUnlock()
+	cached, ok := r.view.lists[parentPath]
+	if !ok || !time.Now().Before(cached.expires) {
+		return false
+	}
+	for _, child := range cached.entries {
+		if child.Name == name {
+			return false
+		}
+	}
+	// Local mutation commits also hold view.mu. Recheck after CachedEntry's
+	// earlier miss so a newly committed child cannot become a cached absence.
+	_, local := r.view.entries.Get(path)
+	return !local
 }
 
 // CommitResolvedChildren caches every child of a freshly listed parent and
@@ -83,8 +111,9 @@ func (r Resolve) IsRecentLocalDir(path string) bool {
 }
 
 // ResolveWithRuntime walks one path resolution: unavailable paths and cached
-// entries short-circuit; otherwise the parent resolves, the parent dir is
-// listed and the matched child committed into the view.
+// entries short-circuit, as does a fresh parent listing that proves absence;
+// otherwise the parent resolves, the parent dir is listed and the matched
+// child committed into the view.
 func ResolveWithRuntime(ctx context.Context, path string, runtime resolver, resolveParent func(context.Context, string) (drive.Entry, error), listChildren func(context.Context, string, string) ([]drive.Entry, error)) (drive.Entry, error) {
 	path = vfstypes.CleanVirtualPath(path)
 	if runtime.IsUnavailable(path) {
@@ -92,6 +121,9 @@ func ResolveWithRuntime(ctx context.Context, path string, runtime resolver, reso
 	}
 	if entry, ok := runtime.CachedEntry(path); ok {
 		return entry, nil
+	}
+	if runtime.MissingFromFreshList(path) {
+		return drive.Entry{}, fmt.Errorf("%w: %s", ErrNotFound, path)
 	}
 	name, parentPath := vfstypes.SplitVirtualPath(path)
 	parent, err := resolveParent(ctx, parentPath)

@@ -30,6 +30,14 @@ func (stubHost) Entry(string) (drive.Entry, bool) { return drive.Entry{}, false 
 
 func (stubHost) ListGeneration() uint64 { return 0 }
 
+func (h stubHost) HasFreshListCache(parentPath string, now time.Time) bool {
+	if h.cache == nil {
+		return false
+	}
+	cached, ok := h.cache[parentPath]
+	return ok && now.Before(cached.expires)
+}
+
 func (h stubHost) FreshListCache(parentPath string, now time.Time) ([]drive.Entry, bool) {
 	if h.cache == nil {
 		return nil, false

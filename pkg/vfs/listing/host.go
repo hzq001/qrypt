@@ -33,7 +33,13 @@ type View interface {
 	// visibility.
 	Entry(path string) (drive.Entry, bool)
 
-	// View cache.
+	// HasFreshListCache reports whether parentPath has an unexpired complete
+	// listing at now. It must only inspect cache metadata, without cloning
+	// entries or projecting the effective view; false means absent or expired.
+	HasFreshListCache(parentPath string, now time.Time) bool
+	// FreshListCache returns the current effective children of parentPath
+	// when its complete remote listing is fresh at now; false means a reload
+	// is required. The returned entries may include current local children.
 	FreshListCache(parentPath string, now time.Time) ([]drive.Entry, bool)
 	// ListGeneration returns the owner's directory-listing generation. It
 	// advances on every committed mutation; a persisted listing fetched

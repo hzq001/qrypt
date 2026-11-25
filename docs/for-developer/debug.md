@@ -138,6 +138,227 @@ The debug log includes callback names, paths, return codes, durations, and
 sampled runtime messages. The error log is usually the fastest place to look
 for warnings and failures after a reproduction.
 
+### When The Control Endpoint Logs A Response Write Failure
+
+`[CONTROL] JSON response write failed` means writing a serialized response to
+the client failed. Check the reported transport error and the caller's timeout
+or cancellation. The status is already committed when `ResponseWriter.Write`
+returns an error, so qrypt logs the failure without attempting another response.
+JSON encoding failures happen before that write and still return HTTP 500.
+
+Older builds called `http.Error` after either kind of failure. A transport
+failure could therefore produce `http: superfluous response.WriteHeader call`
+from `writeJSON`. That warning identifies a second response attempt; it does not
+establish why the first write failed or explain a FUSE session ending.
+
+### When Finder Reports An Interrupted Connection But The Process Is Alive
+
+A FUSE-T mount uses a local NFS server. A slow cloud metadata lookup can leave
+an NFS request waiting even while qrypt and its helper are alive. Capture the
+FUSE callback durations and driver HTTP events around the interruption; process
+liveness by itself cannot distinguish this stall from a healthy mount.
+
+The local trace on 2026-10-28 contained two 15-second directory-prefetch
+timeouts, a 19.85-second successful remote listing, and a 35.27-second
+`Getattr`. The mount recovered without restarting. This supports a transient
+metadata stall; the system dialog's own trigger event was not captured.
+
+`Getattr`, `Access`, `Opendir`, and `Readdir` now share a 10-second cooperative
+deadline across the complete lookup, including any wait for a shared prefetch.
+The callback waits for the filesystem to return and keeps the existing `EIO`
+mapping for a deadline failure. Mutations and content transfers keep their contexts.
+A driver that ignores cancellation can still exceed the budget, and a directory
+that legitimately takes longer than the budget may need another attempt.
+
+On the local FUSE-T 1.0.44 NFS bridge, a failed lookup returned `ENOENT` to
+`stat(2)` for both FUSE `EIO` and `ETIMEDOUT`. Use the FUSE log's `errc` and
+underlying error to diagnose it; the client error alone cannot prove absence.
+
+Directory-list cache lifetime starts after a successful remote response, so a
+slow response remains usable for the full cache interval. A foreground waiter's
+timeout leaves an independently owned prefetch running. See
+[the metadata deadline decision](../adr/0007-bound-read-only-mount-metadata.md)
+for the constraints and regression coverage.
+
+Repeated missing-file probes have a separate local cost. Previously, even a
+fresh parent listing went through effective-directory projection, whose local
+child merge copied the entire entry cache. The resolver now checks absence in
+the existing fresh parent listing and rechecks the local entry under the view
+lock. It scans that parent's children only. Expired or invalidated listings
+still reload, and pending files keep their existing priority. Prefetch freshness
+checks inspect expiry metadata without projecting children.
+
+To measure this path without a cloud account or remote writes:
+
+```sh
+go test ./pkg/vfs -run '^$' -bench '^BenchmarkVFSStatMissingWithFreshParent$' -benchmem -benchtime=200ms -count=3
+```
+
+The 2026-10-28 Apple M1 Pro run with 100,000 unrelated cached entries reduced
+the missing-file probe's median from 24.26 ms and about 99 MB allocated per
+operation to 0.97 µs and 288 bytes. The fixture keeps the target parent's listing
+fresh; these numbers do not measure a cold remote lookup or its network latency.
+
+### When The Mount Says `not responding`
+
+FUSE-T's NFS backend exports the filesystem over localhost NFS, so a dead mount
+is a kernel NFS symptom, not a driver one. Check the export state first:
+
+```sh
+mount | grep ' from fuse-t:'           # or: nfsstat -m
+```
+
+`Status flags: 0x2,not responding` means the kernel client lost its server. A
+bounded probe then blocks forever instead of failing:
+
+```sh
+perl -e 'alarm 10; exec @ARGV' ls /path/to/mount
+```
+
+If the probe hangs, look for the process, not the driver:
+
+```sh
+pgrep -fl 'qrypt (mount|core)'         # is a mount or Core process still alive?
+tail -n 200 ~/.qrypt/logs/qrypt.log    # look for "[FUSE] Init pid=" / "Destroy pid="
+tail -n 100 ~/.qrypt/logs/qrypt-error.log
+```
+
+A `[FUSE] Destroy pid=N` line without a following `FUSE session ended
+unexpectedly` means the process kept running after the export died: the mount
+cannot recover in place and the session must be restarted. Current builds log
+`FUSE session ended unexpectedly` (with `MountOutcome` reason `"unexpected"` in
+Resident Core mode) and exit non-zero so the service manager restarts them; the
+next start detaches the leftover mount (`[FUSE] detached stale mount at ...`)
+before mounting again.
+
+The two session ends are distinguished by the kernel mount table, not by
+stat(2) on the mount point: `Unmounted externally: ...` with exit code 0 means
+the mount point was already gone (Finder eject, `diskutil unmount`, `umount`),
+while `FUSE session ended unexpectedly` with a non-zero exit means the mount is
+still registered and nothing serves it. Checking stat(2) here would block on the
+dead peer and would still not answer whether the mount is registered.
+
+FUSE-T logs `short read on fuse device` for both, because its socket read
+returns EOF when the export is torn down; that message alone is not evidence of
+a bug. FUSE-T 1.0.44 on macOS 26/27 also produces it during ordinary unmounts;
+1.2.9 carries compatibility fixes for those releases.
+
+Stale-mount recovery on macOS has two FUSE-T specific rules:
+
+- FUSE-T's NFS backend exposes the filesystem as a local NFS mount, so `statfs(2)` reports the
+  type `nfs` and only the mount source names it (`fuse-t:/Qrypt`). A stale
+  FUSE-T mount is recognised by that source; matching the type alone misses it.
+  The FSKit backend instead reports type `fuse-t` and a `file://` session
+  descriptor source, so its FUSE-T identity comes from the type.
+- FUSE-T mounts live and die with the `go-nfsv4` helper it forks per mount, and
+  the helper's command line ends with the mount point:
+
+  ```sh
+  ps -ax -o command= | grep go-nfsv4
+  ```
+
+  No helper for a mount point means the mount can no longer answer, even
+  though `readdir` may return `EIO` (the same errno a live mount returns when a
+  backend call fails) or block. `ensureMountPoint` uses helper liveness instead
+  of the errno for this reason. Note that FUSE-T normally reaps the mount when
+  the mounting process dies, so this only matters when the helper alone is gone.
+
+Note that `Getattr`/`Readdir` warnings in the log are rate-limited to one line
+per second per operation, so `(suppressed=N)` counts slow callbacks that were
+not printed. A few seconds of `Getattr "/"` delay is upstream slowness, not the
+cause of a stuck mount.
+
+### FUSE-T FSKit Mounts
+
+See the [FSKit setup guide](../for-user/macos-fskit.md) for configuration and
+extension activation. The backend must be selected explicitly with
+`[mount.options].darwin = ["backend=fskit", ...]` so the adapter can select its
+write contract before FUSE starts serving requests.
+
+Measured on macOS 27.0.1 with FUSE-T 1.2.9, a plain write/close reaches `Write`
+but does not deliver `Flush` at close. An explicit `fsync(2)` does deliver it.
+FSKit can retain an open item beyond a user file descriptor's lifetime
+([Apple open/close contract](https://developer.apple.com/documentation/fskit/fsvolume/opencloseoperations)),
+so waiting for `Release` also cannot serve as a commit boundary.
+
+For explicit FSKit mounts, `Create`, regular-file `Mknod`, `Write`, and
+`Truncate` commit through the existing synchronous VFS `Flush` before returning
+success. This syncs staging and its journal, then uses the existing asynchronous
+upload quiet window. It introduces no callback timeout or background flush
+timer. Commit errors reach the calling mutation; ordinary FUSE mounts retain
+their callback-driven commit contract.
+
+The FSKit backend still launches `go-nfsv4 --backend fskit <mount-root>`.
+`fskitd` being alive does not prove that a specific qrypt mount is served.
+Helper probes use the canonical mount root, preserving paths containing spaces.
+On unmount, qrypt waits for that helper to exit: the mount table can clear
+several seconds before FUSE-T releases its per-path session lock. Starting a
+new mount earlier fails with `another fskit helper is already active`.
+
+Run the real mount regression without cloud accounts or user data:
+
+```sh
+go build -o /tmp/qrypt-fskit-check ./cmd/qrypt
+python3 scripts/ci/smoke-darwin-fskit.py /tmp/qrypt-fskit-check
+```
+
+The script uses disposable localfs data and verifies close-only writes, fsync,
+atomic rename, writes across upload generations, empty files, truncation, and
+unmount/remount across clean Resident Core restarts (`--stop-core` and
+`qrypt core stop`). It requires an installed and enabled FUSE-T FSKit extension;
+it fails if the mount uses NFS. Its short `/tmp` runtime root keeps the Darwin
+Unix socket path below 104 bytes; a `QRYPT_HOME` beneath the long per-user
+`/var/folders/...` temporary root can fail binding `run/control.sock`.
+
+An older macFUSE/FSKit experiment left an unmountable volume after SIGKILL;
+`umount -f` reported `Stale NFS file handle`, and SIP prevented restarting the
+system FSKit daemon. Use normal shutdown signals for real FSKit experiments;
+the regression above gracefully stops its child process.
+
+### When The Whole Machine Panics Inside The NFS Kext
+
+A kernel panic whose backtrace contains only `com.apple.filesystems.nfs` and
+whose panicked task is an ordinary process reading or writing the mount is not
+a dead-mount symptom: the FUSE-T helper is alive, the panic is the macOS NFS
+client hitting its page-cache invalidation race. The kernel reports
+`Kernel data abort` (fault address `0x90`) or
+`nfs_vinvalbuf2: ubc_msync failed!, error 22`. Report files live in
+`/Library/Logs/DiagnosticReports/panic-full-*.panic`.
+
+The trigger is attribute churn: every attribute the client sees as changed
+re-runs invalidation on that vnode, and a vnode with a live writer is the window
+the kext panics in. FUSE-T's NFS backend uses localhost NFSv4 mounts, so filesystems
+exported through it are the most likely place for the race to surface.
+
+Rules qrypt follows, and that any new entry source must keep ([ADR 0006](../adr/0006-served-attributes-are-stable.md)):
+
+- A path's inode is derived from the path, never from a value that changes
+  while the file is open (`drive.Entry.ID` is the staging generation ID for a
+  pending upload and the remote object ID afterwards).
+- Never synthesize a timestamp per call. Entries without a backend mtime get a
+  fixed value derived from the path.
+- Never let `size` or `mtime` regress or flap between `GETATTR`s for the same
+  path.
+
+`-o noattrcache` does not help: fewer client-side cached attributes means more
+`GETATTR`s and more churn comparisons, not fewer invalidations.
+
+Whether a changing `st_ino` reaches the kernel depends on the mount option:
+FUSE-T's NFS export numbers entries itself by default (the kernel sees 1, 2,
+3…), while `-o use_ino` passes the filesystem's `st_ino` through. Under
+`use_ino` an inode that changes between write generations is exactly the
+"identity keeps shifting under a live writer" pattern, so the path-derived
+inode matters for every mount that sets it.
+
+Real content changes are out of scope: truncating a file and rewriting it makes
+`size` and `mtime` change on purpose, and that invalidation is correct. The
+rules above only forbid changes the client did not cause.
+
+The panic can also be reproduced independently of qrypt by driving attribute
+churn through any FUSE-T filesystem, which is how the FUSE-T issue above
+demonstrates it. The kext-side fix has to come from Apple; server-side attribute
+stability only lowers how often the race runs.
+
 ### Windows
 
 On Windows, qrypt uses a named pipe derived from the per-config runtime

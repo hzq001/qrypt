@@ -252,7 +252,6 @@ func (l *Lister) listChildrenWithMode(ctx context.Context, parentPath, parentID 
 
 func loadRemoteChildrenWithRuntime(ctx context.Context, parentPath, parentID string, prefetch bool, l *Lister) ([]drive.Entry, error) {
 	parentPath = CleanVirtualPath(parentPath)
-	now := time.Now()
 	var entries []drive.Entry
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -262,18 +261,22 @@ func loadRemoteChildrenWithRuntime(ctx context.Context, parentPath, parentID str
 			return nil, err
 		}
 		if l.view.ListGeneration() == generation {
+			// A slow fetch must not consume the lifetime of the result before
+			// callers can use it, especially for repeated lookups of absent
+			// children.
+			fetchedAt := time.Now()
 			if l.listCache != nil {
 				// Persist the raw remote listing before the view projects local
 				// state onto it: the file must never contain pending uploads,
 				// rename shadows or delayed deletes.
-				l.listCache.Put(parentPath, entries, generation, now)
+				l.listCache.Put(parentPath, entries, generation, fetchedAt)
 			}
 			if prefetch {
 				if !l.IsCurrentPrefetchDir(parentPath, parentID) {
 					return nil, fmt.Errorf("vfs: discard stale directory prefetch path=%q id=%q", parentPath, parentID)
 				}
 			}
-			return l.commitRemoteList(parentPath, entries, now.Add(listCacheTTL)), nil
+			return l.commitRemoteList(parentPath, entries, fetchedAt.Add(listCacheTTL)), nil
 		}
 		// A mutation landed while the backend listing was in flight. A
 		// prefetch has no caller waiting for content, so discard it rather
@@ -283,7 +286,7 @@ func loadRemoteChildrenWithRuntime(ctx context.Context, parentPath, parentID str
 			return nil, fmt.Errorf("vfs: discard stale directory prefetch path=%q id=%q", parentPath, parentID)
 		}
 	}
-	return l.commitRemoteList(parentPath, entries, now.Add(listCacheTTL)), nil
+	return l.commitRemoteList(parentPath, entries, time.Now().Add(listCacheTTL)), nil
 }
 
 // cachedChildren serves a directory from the persisted listing cache,
@@ -391,9 +394,7 @@ func (l *Lister) SuppressDirPrefetch(path string) {
 // HasFreshListCache reports whether path has a fresh cached listing.
 func (l *Lister) HasFreshListCache(path string) bool {
 	path = CleanVirtualPath(path)
-	now := time.Now()
-	_, ok := l.view.FreshListCache(path, now)
-	return ok
+	return l.view.HasFreshListCache(path, time.Now())
 }
 
 // StartDirPrefetch records the lifecycle context for background prefetch.

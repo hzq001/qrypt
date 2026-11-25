@@ -1092,3 +1092,27 @@ func TestDarwinMountOptionsHonorExplicitDaemonTimeout(t *testing.T) {
 		t.Fatalf("darwin mount options = %v, want daemon_timeout=120", opts)
 	}
 }
+
+func TestAdapterReaddirNonZeroOffsetReturnsEmptyWithoutFilling(t *testing.T) {
+	t.Parallel()
+	ad := newAdapter(failingListFS{err: errors.New("must not list on non-zero offset")}, StatfsOptions{})
+	errc := ad.Readdir("/", func(name string, _ *fuse.Stat_t, _ int64) bool {
+		t.Fatalf("fill(%q) must not be called for non-zero offset", name)
+		return true
+	}, 0x2570, 0)
+	if errc != 0 {
+		t.Fatalf("Readdir(ofst=0x2570) = %d, want 0", errc)
+	}
+}
+
+func TestAdapterReaddirListErrorDoesNotCallFill(t *testing.T) {
+	t.Parallel()
+	ad := newAdapter(failingListFS{err: errors.New("list backend unavailable")}, StatfsOptions{})
+	errc := ad.Readdir("/dir", func(name string, _ *fuse.Stat_t, _ int64) bool {
+		t.Fatalf("fill(%q) must not be called when List fails", name)
+		return true
+	}, 0, 0)
+	if errc != -fuse.EIO {
+		t.Fatalf("Readdir backend error = %d, want %d", errc, -fuse.EIO)
+	}
+}

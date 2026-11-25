@@ -10,7 +10,7 @@ func (a *adapter) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 	start := time.Now()
 	errc := 0
 	defer func() { logFuseResult("Getattr", path, start, &errc) }()
-	ctx, done, ok := a.beginOp("Getattr", path)
+	ctx, done, ok := a.beginMetadataOp("Getattr", path)
 	if !ok {
 		errc = -fuse.EIO
 		return errc
@@ -41,7 +41,7 @@ func (a *adapter) Access(path string, mask uint32) int {
 	start := time.Now()
 	errc := 0
 	defer func() { a.trace.log("Access", path, "mask=%d err=%d dur=%s", mask, errc, time.Since(start)) }()
-	ctx, done, ok := a.beginOp("Access", path)
+	ctx, done, ok := a.beginMetadataOp("Access", path)
 	if !ok {
 		errc = -fuse.EIO
 		return errc

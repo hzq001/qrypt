@@ -103,6 +103,10 @@ func (h vfsListingView) Entry(path string) (drive.Entry, bool) {
 	return h.rt.CachedEntry(path)
 }
 
+func (h vfsListingView) HasFreshListCache(parentPath string, now time.Time) bool {
+	return h.rt.HasFreshList(parentPath, now)
+}
+
 func (h vfsListingView) FreshListCache(parentPath string, now time.Time) ([]drive.Entry, bool) {
 	entries, ok := h.rt.FreshList(parentPath, now)
 	if !ok {

@@ -271,6 +271,16 @@ func (r Runtime) CacheListedChildren(parentPath string, entries []drive.Entry) {
 	}
 }
 
+// HasFreshList reports whether parentPath has an unexpired complete listing
+// at now. It inspects cache metadata only and never clones its entries.
+func (r Runtime) HasFreshList(parentPath string, now time.Time) bool {
+	parentPath = vfstypes.CleanVirtualPath(parentPath)
+	r.view.mu.RLock()
+	cached, ok := r.view.lists[parentPath]
+	r.view.mu.RUnlock()
+	return ok && now.Before(cached.expires)
+}
+
 // FreshList returns the cached listing for parentPath when it is still
 // fresh, or (nil, false) to force a refetch.
 func (r Runtime) FreshList(parentPath string, now time.Time) ([]drive.Entry, bool) {

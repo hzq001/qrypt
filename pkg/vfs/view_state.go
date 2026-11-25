@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/yinzhenyu/qrypt/pkg/drive"
+	"github.com/yinzhenyu/qrypt/pkg/vfs/vfstypes"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/view"
 )
 
@@ -12,7 +13,12 @@ import (
 // adapt to it without widening the VFS surface.
 
 func (v *VFS) RefreshPath(path string) {
-	view.NewRuntime(v.view).RefreshPath(path)
+	clean := vfstypes.CleanVirtualPath(path)
+	if v.listCache != nil {
+		v.listCache.Delete(clean)
+	}
+	view.NewRuntime(v.view).RefreshPath(clean)
+	v.listGen.Add(1)
 }
 
 func (v *VFS) applyLocalModTime(path string, entry drive.Entry) drive.Entry {
