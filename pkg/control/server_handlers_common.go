@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/yinzhenyu/qrypt/pkg/logging"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/diagnostics"
 
 	"github.com/yinzhenyu/qrypt/pkg/vfs"
@@ -66,11 +67,16 @@ func debugMountAllowed(mountName string, mountNames []string) bool {
 }
 
 func writeJSON(w http.ResponseWriter, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(value); err != nil {
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(append(body, '\n')); err != nil {
+		// Write commits the status even when the connection fails. A second
+		// response cannot report that failure to the disconnected client.
+		logging.L.Warnf("[CONTROL] JSON response write failed: %v", err)
 	}
 }
 
