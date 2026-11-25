@@ -254,8 +254,10 @@ func testRuntimeLayout(tmp string) RuntimeLayout {
 	root := filepath.Join(tmp, "storage")
 	return RuntimeLayout{
 		RootDir:      root,
+		RunDir:       filepath.Join(root, "runtime", "run"),
 		ConfigDir:    filepath.Join(root, "runtime", "config"),
 		ReadCacheDir: filepath.Join(root, "cache", "read"),
+		ListCacheDir: filepath.Join(root, "cache", "lists"),
 		ThumbnailDir: filepath.Join(root, "cache", "thumbnail"),
 		UploadDir:    filepath.Join(root, "runtime", "upload"),
 		StateDir:     filepath.Join(root, "runtime", "state"),
