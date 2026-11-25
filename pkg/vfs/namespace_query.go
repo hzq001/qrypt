@@ -31,6 +31,23 @@ func (n *Namespace) PendingUploads() []PendingUpload {
 	return pending
 }
 
+// FailedRemoteDeletes projects every mount's recorded-but-uncommitted remote
+// deletes into the namespace path space, so a caller that owns the user's
+// intent (`qrypt fs rm`) can match the paths it asked for.
+func (n *Namespace) FailedRemoteDeletes() []FailedRemoteDelete {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	var failed []FailedRemoteDelete
+	for name, fs := range n.mounts {
+		for _, item := range fs.FailedRemoteDeletes() {
+			item.Path = vfstypes.JoinVirtualPath("/"+name, strings.TrimPrefix(item.Path, "/"))
+			failed = append(failed, item)
+		}
+	}
+	sort.Slice(failed, func(i, j int) bool { return failed[i].Path < failed[j].Path })
+	return failed
+}
+
 func (n *Namespace) MountSpaces(ctx context.Context) []MountSpace {
 	n.mu.RLock()
 	mounts := make([]*VFS, 0, len(n.mounts))

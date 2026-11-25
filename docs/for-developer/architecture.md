@@ -97,7 +97,10 @@ individual runtime collaborators:
   the injected `Debouncer`), async write queue, and the admission/replacement
   policy (`eviction.go`, which derives its budget tree from the index on each
   drain rather than maintaining byte counters); no other vfs-domain imports
-- `delete` — delayed remote delete executor
+- `delete` — delayed remote delete executor plus the durable per-mount delete
+  journal (`deletes.jsonl`: append-only JSONL, fsynced, compacted) and the
+  retry policy (`retry.go`), which classifies failures through `pkg/drive`'s
+  taxonomy instead of error text
 - `read` — read domain (window/coalescing/chunk cache) and bounded
   read-event history
 - `listing` — list domain (directory cache, prefetch, effective view)
@@ -524,9 +527,9 @@ every mutex and map directly on `VFS`:
 - `viewState`: cached virtual entries, directory list cache, locally created
   directory visibility, local mtime overlays, and delete/rename visibility
   overlays
-- `deleteTaskState`: delayed delete timers, active remote deletes, and delete
-  failures; it shares the delete overlay lock so visibility and execution state
-  remain consistent
+- `deleteTaskState`: delayed delete timers, active remote deletes, delete
+  failures, and the mount's durable delete journal; it shares the delete
+  overlay lock so visibility and execution state remain consistent
 - `uploadScheduleState`: upload timers and delayed enqueue scheduling
 - `uploadDebugState`: active upload snapshots and upload history
 - `uploadFaultState`: debug upload cancellation fault injection state
@@ -552,7 +555,12 @@ exercise a small internal helper with explicit state initialization.
 
 `vfs.FileSystem` is the file-operation contract. Upload internals such as
 `PendingUpload` are exposed through the narrower `UploadInspector` diagnostic
-interface, not as part of the base filesystem contract. VFS and Namespace also
+interface, not as part of the base filesystem contract. Uncommitted remote
+deletes are likewise exposed through `DeleteInspector`
+(`FailedRemoteDelete`: path, error, attempts, pending, updated_at) and
+forwarded over the resident Core data plane (`GET /v1/fs/failed-deletes`),
+so a caller that owns the user's intent (`qrypt fs rm`) can report the
+failure instead of claiming success it never observed. VFS and Namespace also
 implement `task.Source`, so core task management can consume upload/delete
 background tasks without a legacy adapter layer.
 
@@ -676,6 +684,44 @@ the VFS `SourceUploader` fast path when the destination driver can stream a
 UploadService is not a FUSE entry point: clients should not copy files into a
 mounted qrypt directory to create upload tasks. FUSE and upload tasks share
 VFS/driver state but remain separate protocol adapters.
+
+## Delete State Flow
+
+A remote delete is the only operation whose intent cannot be recovered from the
+backend: the backend will never tell us that the user wanted a path gone, so
+the intent is durable and the failure is never silent. State ownership:
+
+1. **Intent** (`delete_executor.go`, `delete/journal.go`): a request upserts
+   `{path, id, name, is_dir, size, remote_name, attempts, error, updated_at}`
+   into the mount's `deletes.jsonl` and fsyncs it before the first remote
+   attempt. Ownership: `deleteTaskState` owns the journal handle and the timer;
+   the path stays hidden through the delete overlay.
+2. **Attempt** (`delete_executor.go`): the timer fires on the VFS lifecycle
+   context and calls the remote delete boundary.
+3. **Commit** (driver success): the record is dropped (`Done`) and the failure,
+   if any, disappears from `DeleteInspector`.
+4. **Failure**: the attempt is recorded (`RecordAttempt` increments the count
+   and stores the driver's error text); nothing is restored to the view. An
+   attempt the VFS's own lifecycle cancels is not a failure: the backend never
+   answered, so neither an error nor an attempt is recorded and the record stays
+   unanswered for the next replay - a shutting-down process must not report a
+   delete it withdrew, nor spend the attempt budget the next owner needs.
+5. **Retry** (`delete/retry.go`): only failures the shared `drive` taxonomy
+   calls transient are re-armed, capped at 5 remote attempts with
+   2s/10s/1m/5m backoff; deterministic failures (not_found, conflict,
+   permission, and the `unknown` class that contains Baidu's `errno 12`) are
+   reported immediately with no retry.
+6. **Replay** (`VFS.Start`): every record is re-hidden in the view and, while
+   the attempt budget is unspent, re-armed. The recorded remote name is the
+   only rebuilt identity: a replayed entry cannot carry driver-private `Extra`
+   data.
+
+`fs rm` reads the same state through `DeleteInspector` (`GET /v1/fs/failed-deletes`
+on the resident Core) after `WaitPath` settles: a path with an uncommitted
+delete makes the command fail with the driver's error text (exit code 1, or
+exit code 3 when only descendants below a removed directory fail) instead of
+reporting success. `fs journal` prints the same `deletes.jsonl` records in
+its read-only report.
 
 ## Mount Responsibilities
 

@@ -77,11 +77,12 @@ type MountSnapshotQueues struct {
 }
 
 type MountSnapshotOverlay struct {
-	Pending      []vfstypes.PendingUpload `json:"pending,omitempty"`
-	Deleted      []DebugDeletedEntry      `json:"deleted,omitempty"`
-	OverlayOps   []DebugOverlayOp         `json:"overlay_ops,omitempty"`
-	RestoredDirs []DebugTimer             `json:"restored_dirs,omitempty"`
-	CopyHidden   []DebugCopyHidden        `json:"copy_hidden,omitempty"`
+	Pending            []vfstypes.PendingUpload `json:"pending,omitempty"`
+	Deleted            []DebugDeletedEntry      `json:"deleted,omitempty"`
+	OutstandingDeletes []string                 `json:"outstanding_deletes,omitempty"`
+	OverlayOps         []DebugOverlayOp         `json:"overlay_ops,omitempty"`
+	RestoredDirs       []DebugTimer             `json:"restored_dirs,omitempty"`
+	CopyHidden         []DebugCopyHidden        `json:"copy_hidden,omitempty"`
 }
 
 type MountSnapshotUploads struct {
@@ -245,6 +246,14 @@ func (s MountSnapshot) ActiveDeleteTimers() []DebugTimer {
 
 func (s MountSnapshot) ActiveDeletes() []DebugTimer {
 	return s.Queues.ActiveDeletes
+}
+
+// OutstandingDeletes lists the remote deletes that have not committed yet,
+// whether they are still waiting for their timer or already running on the
+// driver. A caller waiting for the mount to go idle must wait for them: the
+// path is not removed until they finish.
+func (s MountSnapshot) OutstandingDeletes() []string {
+	return s.Overlay.OutstandingDeletes
 }
 
 func (s MountSnapshot) HistoricalUploads() []upload.UploadSnapshot {

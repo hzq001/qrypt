@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -16,6 +17,7 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/core"
 	"github.com/yinzhenyu/qrypt/pkg/util"
 	"github.com/yinzhenyu/qrypt/pkg/vfs"
+	idelete "github.com/yinzhenyu/qrypt/pkg/vfs/delete"
 )
 
 // Runtime is the slice of Runtime this package needs: config
@@ -42,6 +44,31 @@ type DebugReport struct {
 	Pending        []PendingDebug   `json:"pending"`
 	PermanentFails int              `json:"permanent_fails"`
 	OrphanStaging  []string         `json:"orphan_staging"`
+	Deletes        DeleteReport     `json:"deletes"`
+}
+
+// DeleteReport is the read-only view of a mount's delete journal
+// (<mount>/deletes.jsonl). It is reported next to the upload journal rather
+// than inside it because the two files record different intents: pending.jsonl
+// holds uploads and deletes.jsonl holds remote deletes that need a live driver.
+type DeleteReport struct {
+	// File names the journal this report came from, so a reader can tell
+	// deletes.jsonl from pending.jsonl without knowing the layout.
+	File    string         `json:"file"`
+	Entries int            `json:"entries"`
+	Failed  int            `json:"failed"`
+	Invalid []InvalidEntry `json:"invalid_entries"`
+	Records []DeleteDebug  `json:"records"`
+}
+
+// DeleteDebug is one live delete-journal record: a path whose remote delete is
+// queued, being attempted, or failed. The journal keeps no staging data - the
+// record is the whole intent - so there is nothing else to check.
+type DeleteDebug struct {
+	Path      string    `json:"path"`
+	Attempts  int       `json:"attempts"`
+	Error     string    `json:"error,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type InvalidEntry struct {
@@ -240,6 +267,79 @@ func InspectCache(target DebugCacheTarget) DebugReport {
 	if report.OrphanStaging == nil {
 		report.OrphanStaging = []string{}
 	}
+	report.Deletes = InspectDeleteJournal(filepath.Join(target.Dir, idelete.JournalName))
+	return report
+}
+
+// deleteJournalEntry is one line of deletes.jsonl: the put/done envelope
+// pkg/vfs/delete writes plus the record it carries. The envelope is re-read
+// here instead of opening the journal through pkg/vfs/delete, because opening
+// it creates the directory and fsyncs - which an inspect command must not do
+// to a mount that has never deleted anything.
+type deleteJournalEntry struct {
+	Op     string                 `json:"op"`
+	Path   string                 `json:"path,omitempty"`
+	Record *idelete.JournalRecord `json:"record,omitempty"`
+}
+
+// InspectDeleteJournal replays a delete journal into its live records. It
+// understands the same ops as the journal's own loader, so a report computed
+// while the mount is running matches what a mount start would replay.
+func InspectDeleteJournal(path string) DeleteReport {
+	report := DeleteReport{File: idelete.JournalName, Invalid: []InvalidEntry{}, Records: []DeleteDebug{}}
+	file, err := os.Open(path)
+	if err != nil {
+		return report
+	}
+	defer file.Close()
+
+	records := map[string]idelete.JournalRecord{}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	line := 0
+	for scanner.Scan() {
+		line++
+		var entry deleteJournalEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			report.Invalid = append(report.Invalid, InvalidEntry{Line: line, Err: err.Error()})
+			continue
+		}
+		switch entry.Op {
+		case "put":
+			if entry.Record == nil || entry.Record.Path == "" {
+				report.Invalid = append(report.Invalid, InvalidEntry{Line: line, Err: "put without record"})
+				continue
+			}
+			records[entry.Record.Path] = *entry.Record
+		case "done":
+			delete(records, entry.Path)
+		case "done_under":
+			prefix := strings.TrimSuffix(entry.Path, "/") + "/"
+			for recordPath := range records {
+				if strings.HasPrefix(recordPath, prefix) {
+					delete(records, recordPath)
+				}
+			}
+		default:
+			report.Invalid = append(report.Invalid, InvalidEntry{Line: line, Err: "unknown op " + entry.Op})
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		report.Invalid = append(report.Invalid, InvalidEntry{Line: line + 1, Err: err.Error()})
+	}
+	for _, record := range records {
+		if record.Error != "" {
+			report.Failed++
+		}
+		report.Records = append(report.Records, DeleteDebug{
+			Path:      record.Path,
+			Attempts:  record.Attempts,
+			Error:     record.Error,
+			UpdatedAt: record.UpdatedAt,
+		})
+	}
+	report.Entries = len(report.Records)
+	sort.Slice(report.Records, func(i, j int) bool { return report.Records[i].Path < report.Records[j].Path })
 	return report
 }
 
@@ -283,6 +383,18 @@ func PrintReport(w io.Writer, report DebugReport) {
 		fmt.Fprintln(w, "orphan staging files:")
 		for _, name := range report.OrphanStaging {
 			fmt.Fprintf(w, "  %s\n", name)
+		}
+	}
+	fmt.Fprintf(w, "delete journal file=%s entries=%d failed=%d invalid=%d\n",
+		report.Deletes.File, report.Deletes.Entries, report.Deletes.Failed, len(report.Deletes.Invalid))
+	for _, inv := range report.Deletes.Invalid {
+		fmt.Fprintf(w, "  delete invalid line %d: %s\n", inv.Line, inv.Err)
+	}
+	if len(report.Deletes.Records) > 0 {
+		fmt.Fprintln(w, "delete records:")
+		for _, record := range report.Deletes.Records {
+			fmt.Fprintf(w, "  %s attempts=%d error=%q updated=%s\n",
+				record.Path, record.Attempts, record.Error, record.UpdatedAt.UTC().Format(time.RFC3339))
 		}
 	}
 }

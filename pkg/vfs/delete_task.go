@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/yinzhenyu/qrypt/pkg/drive"
+	"github.com/yinzhenyu/qrypt/pkg/logging"
 	"github.com/yinzhenyu/qrypt/pkg/task"
 	idelete "github.com/yinzhenyu/qrypt/pkg/vfs/delete"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/view"
@@ -163,18 +164,20 @@ func taskFromDeleteRecord(record deleteTaskRecord) task.Task {
 // source: the record projection and retry/cancel live in the view package;
 // this adapter maps them onto pkg/task and the VFS delete scheduler.
 type vfsDeleteTaskRuntime struct {
-	vis            view.Visibility
-	deleteState    *view.DelayedDeleteState
-	restoreDeleted func(string) (drive.Entry, bool)
-	scheduleDelete func(string, drive.Entry)
+	vis             view.Visibility
+	deleteState     *view.DelayedDeleteState
+	restoreDeleted  func(string) (drive.Entry, bool)
+	deleteCommitted func(string)
+	scheduleDelete  func(string, drive.Entry)
 }
 
 func newVFSDeleteTaskRuntime(v *VFS) vfsDeleteTaskRuntime {
 	return vfsDeleteTaskRuntime{
-		vis:            view.NewVisibility(v.view.Overlay(), v.deletes.deleteState, v.view, nil),
-		deleteState:    v.deletes.deleteState,
-		restoreDeleted: v.restoreDeletedPath,
-		scheduleDelete: v.scheduleDelete,
+		vis:             view.NewVisibility(v.view.Overlay(), v.deletes.deleteState, v.view, nil),
+		deleteState:     v.deletes.deleteState,
+		restoreDeleted:  v.restoreDeletedPath,
+		deleteCommitted: v.deleteCommitted,
+		scheduleDelete:  v.scheduleDelete,
 	}
 }
 
@@ -209,7 +212,11 @@ func deleteTaskRecordFromView(r view.DeleteRecord) deleteTaskRecord {
 }
 
 func (r vfsDeleteTaskRuntime) Restore(path string) (drive.Entry, bool) {
-	return r.restoreDeleted(path)
+	entry, ok := r.restoreDeleted(path)
+	if ok && r.deleteCommitted != nil {
+		r.deleteCommitted(path)
+	}
+	return entry, ok
 }
 
 func (r vfsDeleteTaskRuntime) Retry(record deleteTaskRecord) {
@@ -218,22 +225,32 @@ func (r vfsDeleteTaskRuntime) Retry(record deleteTaskRecord) {
 }
 
 // DeleteService groups the VFS delete-domain state: the delayed-delete state
-// (glossary: 延迟删除) and the delete delay. Owned by the delete scheduler;
+// (glossary: 延迟删除), the delete delay, and the durable journal of queued
+// deletes that outlives the process. Owned by the delete scheduler;
 // initialized in New.
 type DeleteService struct {
 	deleteState *view.DelayedDeleteState
 	delay       time.Duration
+	journal     *idelete.Journal
 }
 
-// newDeleteService builds the delete domain state together.
-func newDeleteService(deleteState *view.DelayedDeleteState, delay time.Duration) *DeleteService {
-	return &DeleteService{deleteState: deleteState, delay: delay}
+// newDeleteService builds the delete domain state together. journal may be nil
+// when no storage directory is configured (no durability).
+func newDeleteService(deleteState *view.DelayedDeleteState, delay time.Duration, journal *idelete.Journal) *DeleteService {
+	return &DeleteService{deleteState: deleteState, delay: delay, journal: journal}
 }
 
-// Close stops the pending delete timers. Called by the VFS lifecycle;
-// in-flight deletes run on the VFS lifecycle context and cancel with it.
+// Close stops the pending delete timers and closes the delete journal. Called
+// by the VFS lifecycle; in-flight deletes run on the VFS lifecycle context and
+// cancel with it. Every journal write is already flushed to disk, so closing
+// only releases the file handle.
 func (d *DeleteService) Close() {
 	d.deleteState.StopAll()
+	if d.journal != nil {
+		if err := d.journal.Close(); err != nil {
+			logging.L.Warnf("[VFS] close delete journal failed err=%v", err)
+		}
+	}
 }
 
 // Compile-time interface satisfaction check.

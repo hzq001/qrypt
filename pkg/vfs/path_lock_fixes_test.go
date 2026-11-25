@@ -64,6 +64,18 @@ func (r *failingReadRemote) Read(context.Context, drive.Entry) (io.ReadCloser, e
 }
 func (r *failingReadRemote) InvalidateReadCache(drive.Entry) {}
 
+// countStagingFiles counts the mount's staging artifacts, which is what an
+// orphan check cares about: the storage directory itself also holds the upload
+// and delete journals (pending.jsonl, deletes.jsonl).
+func countStagingFiles(t *testing.T, storage string) int {
+	t.Helper()
+	dir := filepath.Join(storage, "staging")
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	return countFiles(t, dir)
+}
+
 func countFiles(t *testing.T, root string) int {
 	t.Helper()
 	n := 0
@@ -91,12 +103,13 @@ func TestStageExistingCleansStagingOnRemoteError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = fs.Close(context.Background()) })
 	remote := &failingReadRemote{entry: drive.Entry{ID: "remote", Name: "file.txt", Size: 5, ModTime: time.Now()}}
 	err = fs.stageExistingWithDeps(context.Background(), "/file.txt", fs.uploads, remote)
 	if err == nil {
 		t.Fatal("expected stageExistingWithDeps to fail")
 	}
-	if n := countFiles(t, storage); n != 0 {
-		t.Fatalf("staging orphan left behind: %d files in storage dir", n)
+	if n := countStagingFiles(t, storage); n != 0 {
+		t.Fatalf("staging orphan left behind: %d files in staging dir", n)
 	}
 }

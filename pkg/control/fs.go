@@ -85,6 +85,12 @@ type FSService interface {
 	Resolve(ctx context.Context, path string) (FSResolveResult, error)
 }
 
+// FSDeleteInspectorService is an optional extension of FSService that reports
+// remote deletes requested on the owner filesystem that have not committed yet.
+type FSDeleteInspectorService interface {
+	FailedDeletes(ctx context.Context) ([]vfs.FailedRemoteDelete, error)
+}
+
 // FSResolveResult is the backend identity of one namespace path.
 type FSResolveResult struct {
 	Path       string `json:"path"`
@@ -199,6 +205,8 @@ func (s *CommandServer) handleFSOperation(w http.ResponseWriter, r *http.Request
 		s.handleFSMountSpaces(w, r)
 	case "pending":
 		s.handleFSPendingUploads(w, r)
+	case "failed-deletes":
+		s.handleFSFailedDeletes(w, r)
 	case "wait":
 		s.handleFSWait(w, r)
 	case "idle":
@@ -579,6 +587,27 @@ func (s *CommandServer) handleFSPendingUploads(w http.ResponseWriter, r *http.Re
 	writeJSON(w, map[string]any{"pending": pending})
 }
 
+func (s *CommandServer) handleFSFailedDeletes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w)
+		return
+	}
+	inspector, ok := s.fs.(FSDeleteInspectorService)
+	if !ok {
+		writeNotImplemented(w, "failed deletes inspector unavailable")
+		return
+	}
+	failed, err := inspector.FailedDeletes(r.Context())
+	if err != nil {
+		writeFSError(w, err)
+		return
+	}
+	if failed == nil {
+		failed = []vfs.FailedRemoteDelete{}
+	}
+	writeJSON(w, map[string]any{"failed": failed})
+}
+
 // --- client side -----------------------------------------------------------
 
 // FSStat returns metadata for one Core path.
@@ -673,6 +702,22 @@ func (c *Client) FSPendingUploads(ctx context.Context) ([]vfs.PendingUpload, err
 		return nil, fmt.Errorf("control: decode fs pending: %w", err)
 	}
 	return payload.Pending, nil
+}
+
+// FSFailedDeletes lists remote deletes recorded by the owner Core that have not
+// committed yet.
+func (c *Client) FSFailedDeletes(ctx context.Context) ([]vfs.FailedRemoteDelete, error) {
+	body, err := c.Get(ctx, "/v1/fs/failed-deletes")
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Failed []vfs.FailedRemoteDelete `json:"failed"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("control: decode fs failed-deletes: %w", err)
+	}
+	return payload.Failed, nil
 }
 
 // FSCopy runs a direct backend-to-backend copy on the Core and returns the

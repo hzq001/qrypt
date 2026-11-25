@@ -168,17 +168,29 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 	if uploadDir == "" {
 		uploadDir = opts.StorageDir
 	}
+	deleteJournal, err := openDeleteJournal(uploadDir)
+	if err != nil {
+		return nil, err
+	}
+	closeDeleteJournal := func() {
+		if deleteJournal != nil {
+			_ = deleteJournal.Close()
+		}
+	}
 	stores, err := newStores(opts.Name, uploadDir, readCacheDir, opts.CacheMaxBytes)
 	if err != nil {
+		closeDeleteJournal()
 		return nil, err
 	}
 	listStore, err := listcache.NewStore(opts.ListCacheDir, opts.Name, opts.ListCacheIdentity, opts.ListCacheTTL, opts.ListCacheMaxBytes)
 	if err != nil {
+		closeDeleteJournal()
 		_ = stores.Close()
 		return nil, err
 	}
 	source, err := drive.NewReadSource(driver, opts.Read)
 	if err != nil {
+		closeDeleteJournal()
 		_ = stores.Close()
 		if listStore != nil {
 			_ = listStore.Close()
@@ -202,7 +214,7 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 		done:          done,
 		view:          vs,
 		read:          read.NewState(stores.readCacheStore),
-		deletes:       newDeleteService(deleteState, opts.DeleteDelay),
+		deletes:       newDeleteService(deleteState, opts.DeleteDelay, deleteJournal),
 		listing:       listing.NewState(),
 		activeDebug:   observe.NewActiveStore(opts.Name),
 		faults:        faultinject.NewRegistry(0),
@@ -284,6 +296,7 @@ func (v *VFS) Start(ctx context.Context) {
 	v.lifecycleMu.Unlock()
 	if running {
 		v.Resume(ctx)
+		v.resumeDeletes(ctx)
 	}
 	// Graceful stop: when the owning context is cancelled (or Close is
 	// called directly), stop the upload/delete timers, wait for the

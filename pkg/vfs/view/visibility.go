@@ -65,6 +65,7 @@ func (r Visibility) RestoreDeletedPath(path string) (drive.Entry, bool) {
 	}
 	r.deleteState.clearFailureLocked(path)
 	r.deleteState.clearTakeoverLocked(path)
+	r.deleteState.clearOutstandingLocked(path)
 	r.overlay.removeDeleted(path)
 	if r.deleteState.unscheduleLocked(path) {
 		logging.L.Infof("[VFS] canceled pending delete for restored path=%q id=%q", path, entry.ID)
@@ -94,6 +95,7 @@ func (r Visibility) RestoreDeletedAncestor(path string) {
 	r.overlay.removeDeleted(restorePath)
 	r.deleteState.clearFailureLocked(restorePath)
 	r.deleteState.clearTakeoverLocked(restorePath)
+	r.deleteState.clearOutstandingLocked(restorePath)
 	if r.deleteState.unscheduleLocked(restorePath) {
 		logging.L.Infof("[VFS] canceled pending delete for restored ancestor path=%q id=%q requested=%q", restorePath, entry.ID, path)
 	}
@@ -115,6 +117,7 @@ func (r Visibility) CancelDeletedFile(path string) {
 	if ok && !entry.IsDir {
 		r.overlay.removeDeleted(path)
 		r.deleteState.clearFailureLocked(path)
+		r.deleteState.clearOutstandingLocked(path)
 		if r.deleteState.unscheduleLocked(path) {
 			logging.L.Infof("[VFS] canceled pending delete for recreated file path=%q id=%q", path, entry.ID)
 		}
@@ -344,10 +347,18 @@ func (r Visibility) BeginDelete(path string, entryID string) bool {
 	defer r.overlay.mu.Unlock()
 	current, ok := r.overlay.deleted[path]
 	if !ok || current.ID != entryID {
+		if _, scheduled := r.deleteState.scheduler.Keys()[path]; !scheduled {
+			r.deleteState.clearOutstandingLocked(path)
+			r.deleteState.notifyChangedLocked()
+		}
 		return false
 	}
 	for takeover := range r.deleteState.takeovers {
 		if takeover != path && vfstypes.IsPathUnder(path, takeover) {
+			if _, scheduled := r.deleteState.scheduler.Keys()[path]; !scheduled {
+				r.deleteState.clearOutstandingLocked(path)
+				r.deleteState.notifyChangedLocked()
+			}
 			return false
 		}
 	}
@@ -361,6 +372,7 @@ func (r Visibility) MarkDeleteActive(path string, entry drive.Entry) {
 	defer r.overlay.mu.Unlock()
 	r.deleteState.active[path] = entry
 	r.deleteState.clearFailureLocked(path)
+	r.deleteState.markOutstandingLocked(path)
 	r.deleteState.notifyChangedLocked()
 }
 
@@ -372,6 +384,35 @@ func (r Visibility) MarkDeleteFailed(path string, err error) {
 	if err != nil {
 		r.deleteState.failures[path] = err.Error()
 	}
+	// The attempt is over: a retry re-marks the path when it is armed.
+	r.deleteState.clearOutstandingLocked(path)
+	r.deleteState.notifyChangedLocked()
+}
+
+// MarkDeleteFailedRetry clears the active flag and records err while keeping
+// path outstanding until the retry timer is armed, closing the gap where an
+// idle/path waiter could observe neither an active attempt nor a scheduled
+// timer.
+func (r Visibility) MarkDeleteFailedRetry(path string, err error) {
+	r.overlay.mu.Lock()
+	defer r.overlay.mu.Unlock()
+	delete(r.deleteState.active, path)
+	if err != nil {
+		r.deleteState.failures[path] = err.Error()
+	}
+	r.deleteState.markOutstandingLocked(path)
+	r.deleteState.notifyChangedLocked()
+}
+
+// AbortDelete clears the in-flight attempt state for path without recording a
+// failure: the attempt was cancelled locally, so no backend answered. A durable
+// record taken before the attempt stays untouched and therefore replayable; the
+// path stays hidden until the delete commits or is cancelled.
+func (r Visibility) AbortDelete(path string) {
+	r.overlay.mu.Lock()
+	defer r.overlay.mu.Unlock()
+	delete(r.deleteState.active, path)
+	r.deleteState.clearOutstandingLocked(path)
 	r.deleteState.notifyChangedLocked()
 }
 
@@ -384,6 +425,7 @@ func (r Visibility) MarkDeleteComplete(path string, entry drive.Entry) {
 	delete(r.deleteState.active, path)
 	r.deleteState.clearFailureLocked(path)
 	r.deleteState.clearTakeoverLocked(path)
+	r.deleteState.clearOutstandingLocked(path)
 	r.overlay.removeDeleted(path)
 	delete(r.overlay.restoredDirs, path)
 	r.deleteState.notifyChangedLocked()
@@ -402,6 +444,7 @@ func (r Visibility) CancelDelete(path string) {
 	delete(r.deleteState.active, path)
 	r.deleteState.clearFailureLocked(path)
 	r.deleteState.clearTakeoverLocked(path)
+	r.deleteState.clearOutstandingLocked(path)
 	r.deleteState.scheduler.Cancel(path)
 	r.overlay.removeDeleted(path)
 	r.deleteState.notifyChangedLocked()
@@ -415,7 +458,15 @@ func (r Visibility) ScheduleDelete(path string, delay time.Duration, fire func()
 	r.overlay.mu.Lock()
 	r.deleteState.clearFailureLocked(path)
 	r.overlay.mu.Unlock()
-	r.deleteState.scheduler.Schedule(path, delay, fire)
+	r.deleteState.Schedule(path, delay, fire)
+}
+
+// ScheduleDeleteRetry arms another attempt for a delete that already failed,
+// keeping the recorded failure text: ScheduleDelete clears it because it
+// serves the user's explicit re-request, while a retry must keep telling the
+// view why the path is still there after the last attempt.
+func (r Visibility) ScheduleDeleteRetry(path string, delay time.Duration, fire func()) {
+	r.deleteState.Schedule(path, delay, fire)
 }
 
 // TakeoverDirectory cancels every pending delete inside dir (children only,
@@ -440,6 +491,7 @@ func (r Visibility) TakeoverDirectory(dir string) {
 	for _, path := range removed {
 		r.overlay.removeDeleted(path)
 		r.deleteState.clearFailureLocked(path)
+		r.deleteState.clearOutstandingLocked(path)
 	}
 }
 

@@ -141,6 +141,21 @@ func (f *FS) PendingUploads() []vfs.PendingUpload {
 	return pending
 }
 
+// FailedRemoteDeletes lists remote deletes recorded by the Core that have not
+// committed yet.
+func (f *FS) FailedRemoteDeletes() []vfs.FailedRemoteDelete {
+	failed, err := f.client.FSFailedDeletes(context.Background())
+	if err != nil {
+		return nil
+	}
+	return failed
+}
+
+var (
+	_ vfs.UploadInspector = (*FS)(nil)
+	_ vfs.DeleteInspector = (*FS)(nil)
+)
+
 // mapFSError translates transport failures into the sentinel errors the CLI
 // already understands, so a Core-backed `fs stat` reports "not found" like a
 // local VFS instead of a raw HTTP status.

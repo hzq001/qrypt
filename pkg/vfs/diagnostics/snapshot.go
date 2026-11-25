@@ -12,12 +12,13 @@ import (
 // OverlaySnapshot is the raw overlay state a mount snapshot is assembled
 // from (consumer side; pkg/vfs reads it off its overlay).
 type OverlaySnapshot struct {
-	DeleteTimers  []DebugTimer
-	ActiveDeletes []DebugTimer
-	Deleted       []DebugDeletedEntry
-	OverlayOps    []DebugOverlayOp
-	RestoredDirs  []DebugTimer
-	CopyHidden    []DebugCopyHidden
+	DeleteTimers       []DebugTimer
+	ActiveDeletes      []DebugTimer
+	OutstandingDeletes []string
+	Deleted            []DebugDeletedEntry
+	OverlayOps         []DebugOverlayOp
+	RestoredDirs       []DebugTimer
+	CopyHidden         []DebugCopyHidden
 }
 
 // RuntimeSnapshot is the raw read-runtime counters a mount snapshot is
@@ -128,6 +129,7 @@ func AssembleMountSnapshot(name string, runtime SnapshotRuntime) MountSnapshot {
 	overlay := runtime.Overlay()
 	snapshot.Queues.DeleteTimers = overlay.DeleteTimers
 	snapshot.Queues.ActiveDeletes = overlay.ActiveDeletes
+	snapshot.Overlay.OutstandingDeletes = overlay.OutstandingDeletes
 	snapshot.Overlay.Deleted = overlay.Deleted
 	snapshot.Overlay.OverlayOps = overlay.OverlayOps
 	snapshot.Overlay.RestoredDirs = overlay.RestoredDirs

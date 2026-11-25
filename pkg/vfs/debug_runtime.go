@@ -296,6 +296,7 @@ func (r vfsDebugSnapshotRuntime) Overlay() diagnostics.OverlaySnapshot {
 	for _, path := range snap.ActiveDeletes {
 		out.ActiveDeletes = append(out.ActiveDeletes, diagnostics.DebugTimer{Path: path})
 	}
+	out.OutstandingDeletes = append(out.OutstandingDeletes, snap.OutstandingDeletes...)
 	for _, d := range snap.Deleted {
 		out.Deleted = append(out.Deleted, diagnostics.DebugDeletedEntry{
 			Path: d.Path, ID: d.ID, Name: d.Name, IsDir: d.IsDir, Size: d.Size,

@@ -189,13 +189,19 @@ type Overlay struct {
 // active deletes, recorded failures, directory takeovers and the timer
 // scheduler. It shares the Overlay mutex so delete-commit transitions are
 // atomic.
+//
+// outstanding holds the paths whose delete has not committed yet - queued on a
+// timer or running on the driver. It exists so a caller waiting for the mount
+// to go idle (the one-shot CLI, tests) can ask one question with no transition
+// gap: a delete that just left the timer queue is still outstanding.
 type DelayedDeleteState struct {
-	mu        *sync.Mutex
-	scheduler scheduler.KeyedScheduler
-	active    map[string]drive.Entry
-	failures  map[string]string
-	takeovers map[string]struct{}
-	changed   chan struct{}
+	mu          *sync.Mutex
+	scheduler   scheduler.KeyedScheduler
+	active      map[string]drive.Entry
+	failures    map[string]string
+	takeovers   map[string]struct{}
+	outstanding map[string]struct{}
+	changed     chan struct{}
 }
 
 // NewOverlayDelayedDeleteState builds the Overlay+DelayedDeleteState composite sharing one mutex. The
@@ -210,12 +216,13 @@ func NewOverlayDelayedDeleteState() (*Overlay, *DelayedDeleteState) {
 		copyHiddenChildren: map[string]map[string]time.Time{},
 		deletedDirs:        map[string]struct{}{},
 	}, &DelayedDeleteState{
-		mu:        mu,
-		scheduler: scheduler.NewTimeKeyedScheduler(),
-		active:    map[string]drive.Entry{},
-		failures:  map[string]string{},
-		takeovers: map[string]struct{}{},
-		changed:   make(chan struct{}),
+		mu:          mu,
+		scheduler:   scheduler.NewTimeKeyedScheduler(),
+		active:      map[string]drive.Entry{},
+		failures:    map[string]string{},
+		takeovers:   map[string]struct{}{},
+		outstanding: map[string]struct{}{},
+		changed:     make(chan struct{}),
 	}
 }
 
@@ -368,6 +375,19 @@ func (s *DelayedDeleteState) clearFailureLocked(path string) {
 	delete(s.failures, path)
 }
 
+// markOutstandingLocked records that path has a delete that has not committed
+// yet (queued or running). Callers hold the delete-domain lock.
+func (s *DelayedDeleteState) markOutstandingLocked(path string) {
+	s.outstanding[path] = struct{}{}
+}
+
+// clearOutstandingLocked drops path from the outstanding set: the delete
+// committed, failed for good, was cancelled, or was restored. Callers hold the
+// delete-domain lock.
+func (s *DelayedDeleteState) clearOutstandingLocked(path string) {
+	delete(s.outstanding, path)
+}
+
 // unscheduleLocked cancels a pending delete timer for path, reporting whether
 // one existed. Callers hold the delete-domain lock.
 func (s *DelayedDeleteState) unscheduleLocked(path string) bool {
@@ -413,29 +433,46 @@ func (o *Overlay) SetRestoredDir(path string, expiry time.Time) {
 // shutdown. Used by the VFS lifecycle.
 func (s *DelayedDeleteState) StopAll() {
 	s.scheduler.CancelAll()
-}
-
-// Schedule arms or moves a pending delete timer for path.
-func (s *DelayedDeleteState) Schedule(path string, delay time.Duration, fire func()) {
-	s.scheduler.Schedule(path, delay, fire)
-}
-
-// SetActive marks path as an in-flight delete.
-func (s *DelayedDeleteState) SetActive(path string, entry drive.Entry) {
 	s.mu.Lock()
-	s.active[path] = entry
-	s.clearFailureLocked(path)
+	for path := range s.outstanding {
+		if _, active := s.active[path]; !active {
+			delete(s.outstanding, path)
+		}
+	}
 	s.notifyChangedLocked()
 	s.mu.Unlock()
 }
 
-// SetFailure records a failed delete for path.
+// Schedule arms or moves a pending delete timer for path and marks the delete
+// outstanding until it commits (or is cancelled).
+func (s *DelayedDeleteState) Schedule(path string, delay time.Duration, fire func()) {
+	s.mu.Lock()
+	s.markOutstandingLocked(path)
+	s.mu.Unlock()
+	s.scheduler.Schedule(path, delay, fire)
+}
+
+// SetActive marks path as an in-flight delete. The delete stays outstanding
+// (see SetFailure) until it commits, fails for good or is cancelled.
+func (s *DelayedDeleteState) SetActive(path string, entry drive.Entry) {
+	s.mu.Lock()
+	s.active[path] = entry
+	s.clearFailureLocked(path)
+	s.markOutstandingLocked(path)
+	s.notifyChangedLocked()
+	s.mu.Unlock()
+}
+
+// SetFailure records a failed delete for path. The path stops being
+// outstanding: the attempt is over, and a retry marks it outstanding again when
+// it is armed.
 func (s *DelayedDeleteState) SetFailure(path, errText string) {
 	s.mu.Lock()
 	delete(s.active, path)
 	if errText != "" {
 		s.failures[path] = errText
 	}
+	s.clearOutstandingLocked(path)
 	s.notifyChangedLocked()
 	s.mu.Unlock()
 }
@@ -538,13 +575,17 @@ type CopyHiddenDir struct {
 // OverlaySnapshot is the raw composite state under one lock: delete timers,
 // in-flight deletes, deleted entries, rename overlays, restored dirs and
 // copy-hidden children.
+// OverlaySnapshot is the raw composite state under one lock: delete timers,
+// active remote deletes, outstanding remote deletes, deleted entries, rename
+// overlays, restored dirs and copy-hidden children.
 type OverlaySnapshot struct {
-	DeleteTimers  []string
-	ActiveDeletes []string
-	Deleted       []DeletedEntry
-	RenameOps     []RenameOp
-	RestoredDirs  []Timer
-	CopyHidden    []CopyHiddenDir
+	DeleteTimers       []string
+	ActiveDeletes      []string
+	OutstandingDeletes []string
+	Deleted            []DeletedEntry
+	RenameOps          []RenameOp
+	RestoredDirs       []Timer
+	CopyHidden         []CopyHiddenDir
 }
 
 // Snapshot reads the composite state in one critical section. The slices
@@ -562,6 +603,12 @@ func (o *Overlay) Snapshot(t *DelayedDeleteState) OverlaySnapshot {
 	// in-flight remote deletes would otherwise look idle.
 	for path := range t.active {
 		out.ActiveDeletes = append(out.ActiveDeletes, path)
+	}
+	// Outstanding remote deletes: queued on a timer or running on the driver.
+	// One set, so a caller waiting for the mount to go idle never sees a gap
+	// between the timer firing and the remote call starting.
+	for path := range t.outstanding {
+		out.OutstandingDeletes = append(out.OutstandingDeletes, path)
 	}
 	for path, entry := range o.deleted {
 		out.Deleted = append(out.Deleted, DeletedEntry{
@@ -593,6 +640,7 @@ func (o *Overlay) Snapshot(t *DelayedDeleteState) OverlaySnapshot {
 	}
 	sort.Strings(out.DeleteTimers)
 	sort.Strings(out.ActiveDeletes)
+	sort.Strings(out.OutstandingDeletes)
 	sort.Slice(out.Deleted, func(i, j int) bool { return out.Deleted[i].Path < out.Deleted[j].Path })
 	sort.Slice(out.RenameOps, func(i, j int) bool { return out.RenameOps[i].OldPath < out.RenameOps[j].OldPath })
 	sort.Slice(out.RestoredDirs, func(i, j int) bool { return out.RestoredDirs[i].Path < out.RestoredDirs[j].Path })
@@ -625,11 +673,12 @@ func (r Visibility) DeleteTaskRecords() []DeleteRecord {
 	for p, entry := range r.overlay.deleted {
 		_, running := r.deleteState.active[p]
 		_, scheduled := r.deleteState.scheduler.Keys()[p]
+		_, outstanding := r.deleteState.outstanding[p]
 		records = append(records, DeleteRecord{
 			ID:        deleteTaskID(entry, p),
 			Path:      p,
 			Entry:     entry,
-			Running:   running,
+			Running:   running || (outstanding && !scheduled),
 			Scheduled: scheduled,
 			ErrorText: r.deleteState.failures[p],
 			UpdatedAt: now,

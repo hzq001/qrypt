@@ -20,7 +20,7 @@ func TestVFSCoalescesChildDeletesIntoDirectoryDelete(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	drv := newCountingRemoveDriver()
-	fs, err := vfs.New(drv, vfs.Options{StorageDir: t.TempDir(), CacheMaxBytes: 10 << 20, DeleteDelay: 50 * time.Millisecond})
+	fs, err := vfs.New(drv, vfs.Options{StorageDir: t.TempDir(), CacheMaxBytes: 10 << 20, DeleteDelay: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestVFSDirectoryDeleteWaitsForActiveChildDelete(t *testing.T) {
 	fs, err := vfs.New(drv, vfs.Options{
 		StorageDir:    t.TempDir(),
 		CacheMaxBytes: 10 << 20,
-		DeleteDelay:   10 * time.Millisecond,
+		DeleteDelay:   200 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)

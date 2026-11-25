@@ -38,6 +38,7 @@ type OverlayOps interface {
 	BeginDelete(path, entryID string) bool
 	MarkDeleteActive(path string, entry drive.Entry)
 	MarkDeleteFailed(path string, err error)
+	MarkDeleteAborted(path string)
 	MarkDeleteComplete(path string, entry drive.Entry)
 	CancelDelete(path string)
 }

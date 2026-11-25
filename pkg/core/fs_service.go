@@ -26,6 +26,11 @@ type coreFSService struct {
 	core *Core
 }
 
+var (
+	_ control.FSService                = coreFSService{}
+	_ control.FSDeleteInspectorService = coreFSService{}
+)
+
 func fsEntryFromDrive(path string, entry drive.Entry) control.FSEntry {
 	return control.FSEntry{
 		ID:       entry.ID,
@@ -264,6 +269,17 @@ func (s coreFSService) PendingUploads(ctx context.Context) ([]vfs.PendingUpload,
 	return inspector.PendingUploads(), nil
 }
 
+func (s coreFSService) FailedDeletes(ctx context.Context) ([]vfs.FailedRemoteDelete, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	inspector, ok := s.fs().(vfs.DeleteInspector)
+	if !ok {
+		return nil, nil
+	}
+	return inspector.FailedRemoteDeletes(), nil
+}
+
 func (s coreFSService) Create(ctx context.Context, path string) error {
 	return s.fs().Create(ctx, path)
 }
@@ -360,8 +376,8 @@ func (s coreFSService) WaitIdle(ctx context.Context, timeout time.Duration) erro
 			return fmt.Errorf("core: upload of %v failed permanently", failed)
 		}
 		activeCount := 0
-		if s.core != nil && s.core.tasks != nil {
-			active, err := s.core.tasks.ListTasks(ctx, task.Filter{States: activeTaskStates})
+		if s.core != nil && s.fs() != nil {
+			active, err := s.core.ListTasks(ctx, task.Filter{States: activeTaskStates})
 			if err != nil {
 				return err
 			}
@@ -397,10 +413,22 @@ func (s coreFSService) InvalidateList(ctx context.Context, path string) error {
 	return fs.InvalidateListCache(ctx, path)
 }
 
+func matchesPathOrDescendant(candidate, target string) bool {
+	clean := pathpkg.Clean("/" + strings.TrimPrefix(candidate, "/"))
+	if clean == target {
+		return true
+	}
+	if target == "/" {
+		return strings.HasPrefix(clean, "/")
+	}
+	return strings.HasPrefix(clean, target+"/")
+}
+
 func (s coreFSService) WaitPath(ctx context.Context, path string, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	cleanPath := pathpkg.Clean("/" + strings.TrimPrefix(path, "/"))
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -408,21 +436,27 @@ func (s coreFSService) WaitPath(ctx context.Context, path string, timeout time.D
 		pendingForPath := 0
 		if inspector, ok := s.fs().(vfs.UploadInspector); ok {
 			for _, pending := range inspector.PendingUploads() {
-				if pending.Path != path {
+				if !matchesPathOrDescendant(pending.Path, cleanPath) {
 					continue
 				}
 				if pending.PermanentFail {
-					return fmt.Errorf("core: upload of %s failed permanently: %s", path, pending.LastError)
+					return fmt.Errorf("core: upload of %s failed permanently: %s", pending.Path, pending.LastError)
 				}
 				pendingForPath++
 			}
 		}
-		if pendingForPath == 0 && s.core != nil && s.core.tasks != nil {
-			active, err := s.core.tasks.ListTasks(ctx, task.Filter{Path: path, States: activeTaskStates})
+		var activeForPath []task.Task
+		if pendingForPath == 0 && s.core != nil && s.fs() != nil {
+			active, err := s.core.ListTasks(ctx, task.Filter{States: activeTaskStates})
 			if err != nil {
 				return err
 			}
-			if len(active) == 0 {
+			for _, item := range active {
+				if matchesPathOrDescendant(item.Path, cleanPath) {
+					activeForPath = append(activeForPath, item)
+				}
+			}
+			if len(activeForPath) == 0 {
 				return nil
 			}
 		} else if pendingForPath == 0 {
@@ -432,16 +466,14 @@ func (s coreFSService) WaitPath(ctx context.Context, path string, timeout time.D
 			pending := []string{}
 			if inspector, ok := s.fs().(vfs.UploadInspector); ok {
 				for _, item := range inspector.PendingUploads() {
-					pending = append(pending, item.Path+"("+item.FID+")")
+					if matchesPathOrDescendant(item.Path, cleanPath) {
+						pending = append(pending, item.Path+"("+item.FID+")")
+					}
 				}
 			}
 			tasks := []string{}
-			if s.core != nil && s.core.tasks != nil {
-				if items, err := s.core.tasks.ListTasks(ctx, task.Filter{Path: path, States: activeTaskStates}); err == nil {
-					for _, item := range items {
-						tasks = append(tasks, item.ID+":"+string(item.State))
-					}
-				}
+			for _, item := range activeForPath {
+				tasks = append(tasks, item.ID+":"+string(item.State))
 			}
 			return fmt.Errorf("core: timed out waiting for %s to settle (pending=%v tasks=%v)", path, pending, tasks)
 		}

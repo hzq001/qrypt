@@ -33,12 +33,23 @@ func (e *Executor) Execute(ctx context.Context, path string, entry drive.Entry) 
 	if err == nil {
 		err = e.deps.Driver.Remove(ctx, entry)
 	}
-	e.deps.Health.RecordResult(drive.HealthOpDelete, err)
 	if err != nil {
+		// An attempt our own context cancelled was never answered by the
+		// backend: the request may not even have been sent. Recording it as a
+		// failure would report a path as failed on the strength of our own
+		// shutdown, spend the attempt budget the next replay needs, and mark the
+		// driver unhealthy for a request we withdrew.
+		if ctx.Err() != nil {
+			logging.L.Warnf("[VFS] delete aborted path=%q id=%q dir=%t err=%v", path, entry.ID, entry.IsDir, err)
+			overlay.MarkDeleteAborted(path)
+			return
+		}
+		e.deps.Health.RecordResult(drive.HealthOpDelete, err)
 		logging.L.Warnf("[VFS] delete remote failed path=%q id=%q dir=%t err=%v", path, entry.ID, entry.IsDir, err)
 		overlay.MarkDeleteFailed(path, err)
 		return
 	}
+	e.deps.Health.RecordResult(drive.HealthOpDelete, nil)
 	logging.L.Infof("[VFS] delete remote complete path=%q id=%q dir=%t", path, entry.ID, entry.IsDir)
 	overlay.MarkDeleteComplete(path, entry)
 	e.deps.Upload.RemoveUploadState(path)

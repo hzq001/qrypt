@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/vfs/diagnostics"
 
 	clifs "github.com/yinzhenyu/qrypt/internal/cli/fs"
+	clijournal "github.com/yinzhenyu/qrypt/internal/cli/journal"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
 	"github.com/yinzhenyu/qrypt/pkg/vfs"
 )
@@ -113,5 +115,69 @@ func TestJournalMaintenanceCommandsWereRemoved(t *testing.T) {
 	help := runCommand(t, "fs", "journal", "--help")
 	if strings.Contains(help, "replay") || strings.Contains(help, "prune") {
 		t.Fatalf("journal help still advertises maintenance commands:\n%s", help)
+	}
+}
+
+func TestJournalInspectReportsDeleteJournal(t *testing.T) {
+	t.Parallel()
+	cache := t.TempDir()
+	deleteJournal := filepath.Join(cache, "deletes.jsonl")
+	lines := []string{
+		`{"op":"put","record":{"path":"/baidu/x.bin","id":"id-x","attempts":1,"error":"baidu api errno 12","updated_at":"2026-10-16T12:00:00Z"}}`,
+		`{"op":"put","record":{"path":"/baidu/gone.bin","id":"id-gone","attempts":1,"updated_at":"2026-10-16T12:00:00Z"}}`,
+		`{"op":"done","path":"/baidu/gone.bin"}`,
+	}
+	if err := os.WriteFile(deleteJournal, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	root := NewRootCommand()
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "journal", "--cache-dir", cache, "--json"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("journal inspect failed: %v", err)
+	}
+	var report struct {
+		Reports []clijournal.DebugReport `json:"reports"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("journal JSON invalid: %v\n%s", err, out.String())
+	}
+	if len(report.Reports) != 1 {
+		t.Fatalf("reports = %+v, want one cache report", report.Reports)
+	}
+	deletes := report.Reports[0].Deletes
+	if deletes.File != "deletes.jsonl" || deletes.Entries != 1 || deletes.Failed != 1 {
+		t.Fatalf("delete report = %+v, want the one uncommitted delete", deletes)
+	}
+	if len(deletes.Records) != 1 || deletes.Records[0].Path != "/baidu/x.bin" || deletes.Records[0].Error != "baidu api errno 12" {
+		t.Fatalf("delete records = %+v, want /baidu/x.bin with the driver error", deletes.Records)
+	}
+
+	// A human reading the same report must be able to tell the delete journal
+	// from the upload journal.
+	out.Reset()
+	root = NewRootCommand()
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "journal", "--cache-dir", cache})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("journal inspect failed: %v", err)
+	}
+	for _, want := range []string{"delete journal file=deletes.jsonl", "/baidu/x.bin", "baidu api errno 12"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("inspect output missing %q:\n%s", want, out.String())
+		}
+	}
+
+	// Read-only inspect and removed maintenance commands must leave deletes.jsonl intact.
+	data, err := os.ReadFile(deleteJournal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "/baidu/x.bin") {
+		t.Fatalf("journal inspect modified the delete journal:\n%s", data)
 	}
 }

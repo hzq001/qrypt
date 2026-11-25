@@ -205,6 +205,26 @@ type ModTimeWriter interface {
 	SetModTime(ctx context.Context, path string, modTime time.Time) error
 }
 
+// DeleteInspector reports remote deletes that were requested but did not
+// commit. A queued remote delete that failed stays recorded - and the path
+// stays hidden in the local view - until a later attempt succeeds or the
+// delete is cancelled, so a caller that owns the user's intent (`qrypt fs rm`)
+// can report the failure instead of claiming success it never observed.
+type DeleteInspector interface {
+	FailedRemoteDeletes() []FailedRemoteDelete
+}
+
+// FailedRemoteDelete is one path whose remote delete has not committed.
+// Attempts counts the remote attempts spent so far; Pending is true while
+// another attempt is still scheduled (the budget is not spent yet).
+type FailedRemoteDelete struct {
+	Path      string    `json:"path"`
+	Error     string    `json:"error"`
+	Attempts  int       `json:"attempts"`
+	Pending   bool      `json:"pending"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // SpaceProvider reports aggregate backend capacity.
 type SpaceProvider interface {
 	Space(ctx context.Context) (drive.Space, error)
@@ -554,3 +574,5 @@ var _ MountedFileSystem = (*VFS)(nil)
 var _ MountedFileSystem = (*Namespace)(nil)
 var _ Capabler = (*VFS)(nil)
 var _ Capabler = (*Namespace)(nil)
+var _ DeleteInspector = (*VFS)(nil)
+var _ DeleteInspector = (*Namespace)(nil)
