@@ -222,7 +222,7 @@ func (d *Driver) uploadSlice(ctx context.Context, progress drive.UploadProgress,
 	}
 	query := u.Query()
 	query.Set("method", "upload")
-	query.Set("access_token", d.accessToken)
+	query.Set("access_token", d.currentAccessToken())
 	query.Set("type", "tmpfile")
 	query.Set("path", remotePath)
 	query.Set("uploadid", uploadID)
@@ -282,9 +282,10 @@ func (d *Driver) request(ctx context.Context, method, rawURL string, params, for
 		if err := d.ensureToken(ctx); err != nil {
 			return err
 		}
+		usedToken := d.currentAccessToken()
 		err := d.doRequest(ctx, method, rawURL, params, form, out)
 		if tokenExpired(err) {
-			if refreshErr := d.refresh(ctx); refreshErr != nil {
+			if refreshErr := d.refreshForced(ctx, usedToken); refreshErr != nil {
 				return refreshErr
 			}
 			lastErr = err
@@ -310,7 +311,7 @@ func (d *Driver) doRequest(ctx context.Context, method, rawURL string, params, f
 		return err
 	}
 	query := u.Query()
-	query.Set("access_token", d.accessToken)
+	query.Set("access_token", d.currentAccessToken())
 	for key, value := range params {
 		query.Set(key, value)
 	}
@@ -343,7 +344,7 @@ func (d *Driver) doRequest(ctx context.Context, method, rawURL string, params, f
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return drive.HTTPError("baidu_netdisk: upload session", nil, resp, data)
+		return drive.HTTPError("baidu_netdisk: api", req, resp, data)
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {

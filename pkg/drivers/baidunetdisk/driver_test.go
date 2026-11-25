@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -823,5 +824,238 @@ func TestServerSideCopyRejectsDirectory(t *testing.T) {
 	d := New(Options{RefreshToken: "r", ClientID: "c", ClientSecret: "s", RootPath: "/Qrypt"})
 	if _, err := d.Copy(context.Background(), drive.Entry{ID: "/Qrypt/dir", IsDir: true}, "0", "x"); err == nil {
 		t.Fatal("directory copy should fail")
+	}
+}
+
+func TestReadRetriesOnForbiddenDownloadLink(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	var downloadCalls int
+	var tokenCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			tokenCalls++
+			writeJSON(t, w, tokenResp{AccessToken: fmt.Sprintf("access-%d", tokenCalls), RefreshToken: "refresh", ExpiresIn: 3600})
+		case "/rest/2.0/xpan/multimedia":
+			writeJSON(t, w, downloadResp{List: []struct {
+				Dlink string `json:"dlink"`
+			}{{Dlink: srvURL(r) + "/dlink"}}})
+		case "/dlink":
+			w.Header().Set("Location", srvURL(r)+"/download")
+			w.WriteHeader(http.StatusFound)
+		case "/download":
+			downloadCalls++
+			if downloadCalls == 1 {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("recovered"))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	d := New(Options{
+		RefreshToken: "refresh",
+		ClientID:     "client",
+		ClientSecret: "secret",
+		OAuthURL:     srv.URL + "/token",
+		APIBaseURL:   srv.URL + "/rest/2.0",
+		UseOnlineAPI: false,
+	})
+	entry := driveEntry("/Qrypt/file.bin", 42, 9)
+	rc, err := d.Read(ctx, entry, 0, 0)
+	if err != nil {
+		t.Fatalf("Read should succeed after retry, got: %v", err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "recovered" {
+		t.Fatalf("read content = %q, want recovered", string(data))
+	}
+	if downloadCalls != 2 {
+		t.Fatalf("downloadCalls = %d, want 2", downloadCalls)
+	}
+}
+
+func TestSetLastErrorIgnoresContextCanceled(t *testing.T) {
+	t.Parallel()
+
+	d := New(Options{RefreshToken: "r"})
+	d.setLastError(context.Canceled)
+	snapshot, err := d.DebugSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Health != "ok" {
+		t.Fatalf("health = %q, want ok after context.Canceled", snapshot.Health)
+	}
+	if val := snapshot.Extra[drive.DebugExtraLastError]; val != "" {
+		t.Fatalf("last_error = %v, want empty on canceled context", val)
+	}
+}
+
+func TestReadDownloadRedirectHead403FallsBackToRangeGet(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	var headCalls, getCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			writeJSON(t, w, tokenResp{AccessToken: "access-1", RefreshToken: "refresh", ExpiresIn: 3600})
+		case "/rest/2.0/xpan/multimedia":
+			writeJSON(t, w, downloadResp{List: []struct {
+				Dlink string `json:"dlink"`
+			}{{Dlink: srvURL(r) + "/dlink"}}})
+		case "/dlink":
+			switch r.Method {
+			case http.MethodHead:
+				headCalls.Add(1)
+				w.WriteHeader(http.StatusForbidden)
+			case http.MethodGet:
+				getCalls.Add(1)
+				if got := r.Header.Get("Range"); got != "bytes=0-0" {
+					t.Errorf("fallback GET Range = %q, want bytes=0-0", got)
+				}
+				w.Header().Set("Location", srvURL(r)+"/download")
+				w.WriteHeader(http.StatusFound)
+			default:
+				t.Errorf("unexpected method %s on /dlink", r.Method)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+			}
+		case "/download":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("payload-via-get-redirect"))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	d := New(Options{
+		RefreshToken: "refresh",
+		ClientID:     "client",
+		ClientSecret: "secret",
+		OAuthURL:     srv.URL + "/token",
+		APIBaseURL:   srv.URL + "/rest/2.0",
+		UseOnlineAPI: false,
+	})
+	rc, err := d.Read(ctx, driveEntry("/Qrypt/file.bin", 24, 9), 0, 0)
+	if err != nil {
+		t.Fatalf("Read() error = %v, want fallback GET redirect to succeed", err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "payload-via-get-redirect" {
+		t.Fatalf("read content = %q, want payload-via-get-redirect", string(data))
+	}
+	if headCalls.Load() != 1 || getCalls.Load() != 1 {
+		t.Fatalf("dlink calls head=%d get=%d, want 1/1", headCalls.Load(), getCalls.Load())
+	}
+}
+
+func TestReadRetriesAfterDownloadRedirect403WithForcedRefresh(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	var tokenCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			n := tokenCalls.Add(1)
+			writeJSON(t, w, tokenResp{
+				AccessToken:  fmt.Sprintf("access-%d", n),
+				RefreshToken: fmt.Sprintf("refresh-%d", n),
+				ExpiresIn:    3600,
+			})
+		case "/rest/2.0/xpan/nas":
+			writeJSON(t, w, map[string]any{"errno": 0, "netdisk_name": "acct"})
+		case "/rest/2.0/xpan/multimedia":
+			writeJSON(t, w, downloadResp{List: []struct {
+				Dlink string `json:"dlink"`
+			}{{Dlink: srvURL(r) + "/dlink"}}})
+		case "/dlink":
+			if r.URL.Query().Get("access_token") != "access-2" {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Location", srvURL(r)+"/download")
+			w.WriteHeader(http.StatusFound)
+		case "/download":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("after-forced-refresh"))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	d := New(Options{
+		RefreshToken: "refresh-0",
+		ClientID:     "client",
+		ClientSecret: "secret",
+		OAuthURL:     srv.URL + "/token",
+		APIBaseURL:   srv.URL + "/rest/2.0",
+		UseOnlineAPI: false,
+	})
+	if err := d.Init(ctx); err != nil {
+		t.Fatalf("Init() = %v", err)
+	}
+	rc, err := d.Read(ctx, driveEntry("/Qrypt/file.bin", 20, 9), 0, 0)
+	if err != nil {
+		t.Fatalf("Read() after redirect 403 error = %v, want forced refresh retry to succeed", err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "after-forced-refresh" {
+		t.Fatalf("read content = %q, want after-forced-refresh", string(data))
+	}
+	if got := tokenCalls.Load(); got != 2 {
+		t.Fatalf("tokenCalls = %d, want 2 (initial + forced refresh)", got)
+	}
+}
+
+func TestDownloadClientUsesNoTotalTimeoutAndDisablesKeepAlives(t *testing.T) {
+	t.Parallel()
+
+	d := New(Options{RefreshToken: "refresh"})
+	if d.downloadClient == nil {
+		t.Fatal("downloadClient = nil, want dedicated HTTP client")
+	}
+	if d.downloadClient.Timeout != 0 {
+		t.Fatalf("downloadClient.Timeout = %s, want 0 (no total timeout on large downloads)", d.downloadClient.Timeout)
+	}
+	dlTr, ok := d.downloadClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("downloadClient.Transport = %T, want *http.Transport", d.downloadClient.Transport)
+	}
+	if !dlTr.DisableKeepAlives {
+		t.Fatal("downloadClient.Transport.DisableKeepAlives = false, want true")
+	}
+	if dlTr.ResponseHeaderTimeout != 60*time.Second {
+		t.Fatalf("downloadClient.Transport.ResponseHeaderTimeout = %s, want 60s", dlTr.ResponseHeaderTimeout)
+	}
+	if d.httpClient == nil || d.httpClient.Timeout != 60*time.Second {
+		t.Fatalf("httpClient = %v, want 60s timeout", d.httpClient)
+	}
+	apiTr, ok := d.httpClient.Transport.(*http.Transport)
+	if !ok || apiTr.ResponseHeaderTimeout != 30*time.Second {
+		t.Fatalf("httpClient.Transport = %T, want *http.Transport with 30s ResponseHeaderTimeout", d.httpClient.Transport)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/drive/session"
 	"github.com/yinzhenyu/qrypt/pkg/drivers/internal/driverutil"
 	"github.com/yinzhenyu/qrypt/pkg/drivers/internal/driverutil/httpclient"
+	"github.com/yinzhenyu/qrypt/pkg/drivers/internal/driverutil/httputil"
 	"github.com/yinzhenyu/qrypt/pkg/logging"
 )
 
@@ -39,6 +40,7 @@ const (
 type Driver struct {
 	drive.UnsupportedOperations
 	httpClient         *http.Client
+	downloadClient     *http.Client
 	refreshToken       string
 	accessToken        string
 	account            string
@@ -59,9 +61,12 @@ type Driver struct {
 	// cred owns the shared-session lifecycle for mounts that reference a
 	// [[credentials]] entry; a nil session keeps the legacy per-mount token
 	// state.
-	cred               *driverutil.CredentialBinding[credentialPayload]
-	tokenSource        string
-	tokenUpdated       time.Time
+	cred         *driverutil.CredentialBinding[credentialPayload]
+	tokenSource  string
+	tokenUpdated time.Time
+	// refreshMu serializes direct OAuth refreshes; tokenMu guards in-memory
+	// token/account fields only and must never be held across network or cred I/O.
+	refreshMu          sync.Mutex
 	tokenMu            sync.Mutex
 	tokenExpires       time.Time
 	downloadCache      sync.Map
@@ -181,8 +186,11 @@ func New(opts Options) *Driver {
 	if downloadUA == "" {
 		downloadUA = defaultDownloadUA
 	}
+	downloadTransport := httputil.DefaultTransport(60 * time.Second)
+	downloadTransport.DisableKeepAlives = true
 	d := &Driver{
-		httpClient:         &http.Client{Timeout: 60 * time.Second},
+		httpClient:         httputil.NewClient(60*time.Second, 30*time.Second),
+		downloadClient:     &http.Client{Transport: downloadTransport},
 		refreshToken:       opts.RefreshToken,
 		accessToken:        opts.AccessToken,
 		configRefreshToken: opts.RefreshToken,
@@ -205,7 +213,7 @@ func New(opts Options) *Driver {
 }
 
 func (d *Driver) Init(ctx context.Context) error {
-	if d.refreshToken == "" {
+	if _, refreshToken, _ := d.tokenStateSnapshot(); refreshToken == "" {
 		return fmt.Errorf("baidu_netdisk: refresh_token is required")
 	}
 	if d.cred.Session() != nil {
@@ -217,7 +225,7 @@ func (d *Driver) Init(ctx context.Context) error {
 	if !d.useOnlineAPI && (d.clientID == "" || d.clientSecret == "") {
 		return fmt.Errorf("baidu_netdisk: client_id and client_secret are required when use_online_api=false")
 	}
-	if d.accessToken == "" || d.tokenExpires.IsZero() || time.Now().After(d.tokenExpires.Add(-defaultTokenSkew)) {
+	if access, _, expires := d.tokenStateSnapshot(); !tokenFresh(access, expires) {
 		if err := d.refresh(ctx); err != nil {
 			d.setLastError(err)
 			return err
@@ -276,9 +284,10 @@ func (d *Driver) DebugSnapshot(ctx context.Context) (drive.DebugSnapshot, error)
 	if lastError != "" {
 		health = "degraded"
 	}
+	tokenSource, tokenUpdated := d.tokenDebugMeta()
 	extra := map[string]any{
-		drive.DebugExtraCredentialSource:   d.tokenSource,
-		drive.DebugExtraCredentialUpdated:  d.tokenUpdated,
+		drive.DebugExtraCredentialSource:   tokenSource,
+		drive.DebugExtraCredentialUpdated:  tokenUpdated,
 		drive.DebugExtraLastError:          lastError,
 		drive.DebugExtraInstantUploadCount: instantUploadCount,
 	}
@@ -319,6 +328,9 @@ func (d *Driver) ResolvePath(ctx context.Context, p string) (string, error) {
 }
 
 func (d *Driver) setLastError(err error) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	d.lastErrorMu.Lock()
 	defer d.lastErrorMu.Unlock()
 	if err == nil {
@@ -350,24 +362,84 @@ func (d *Driver) recordHTTP(ctx context.Context, operation string, req *http.Req
 	d.metrics.Record(ctx, event)
 }
 
+func tokenFresh(access string, expires time.Time) bool {
+	return access != "" && !expires.IsZero() && time.Now().Before(expires.Add(-defaultTokenSkew))
+}
+
+func canReuseToken(access string, expires time.Time, force bool, failedToken string) bool {
+	if !tokenFresh(access, expires) {
+		return false
+	}
+	if !force {
+		return true
+	}
+	return failedToken != "" && access != failedToken
+}
+
+func (d *Driver) currentAccessToken() string {
+	d.tokenMu.Lock()
+	defer d.tokenMu.Unlock()
+	return d.accessToken
+}
+
+func (d *Driver) tokenStateSnapshot() (accessToken, refreshToken string, expiresAt time.Time) {
+	d.tokenMu.Lock()
+	defer d.tokenMu.Unlock()
+	return d.accessToken, d.refreshToken, d.tokenExpires
+}
+
+func (d *Driver) tokenDebugMeta() (source string, updated time.Time) {
+	d.tokenMu.Lock()
+	defer d.tokenMu.Unlock()
+	return d.tokenSource, d.tokenUpdated
+}
+
+func (d *Driver) credentialState() (access, refresh string, expires time.Time, account string) {
+	d.tokenMu.Lock()
+	defer d.tokenMu.Unlock()
+	return d.accessToken, d.refreshToken, d.tokenExpires, d.account
+}
+
 func (d *Driver) ensureToken(ctx context.Context) error {
-	if d.accessToken == "" || (!d.tokenExpires.IsZero() && time.Now().After(d.tokenExpires.Add(-defaultTokenSkew))) {
+	access, _, expires := d.tokenStateSnapshot()
+	if !tokenFresh(access, expires) {
 		return d.refresh(ctx)
 	}
 	return nil
 }
 
 func (d *Driver) refresh(ctx context.Context) error {
+	return d.refreshWithMode(ctx, false, "")
+}
+
+func (d *Driver) refreshForced(ctx context.Context, failedToken string) error {
+	return d.refreshWithMode(ctx, true, failedToken)
+}
+
+func (d *Driver) refreshWithMode(ctx context.Context, force bool, failedToken string) error {
 	if d.cred.Session() != nil {
-		return d.refreshShared(ctx)
+		return d.refreshShared(ctx, force, failedToken)
 	}
-	return d.refreshDirect(ctx)
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+	access, _, expires := d.tokenStateSnapshot()
+	if canReuseToken(access, expires, force, failedToken) {
+		return nil
+	}
+	return d.refreshDirectLocked(ctx)
 }
 
 func (d *Driver) refreshDirect(ctx context.Context) error {
-	d.tokenMu.Lock()
-	defer d.tokenMu.Unlock()
-	if d.refreshToken == "" {
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+	return d.refreshDirectLocked(ctx)
+}
+
+// refreshDirectLocked requires d.refreshMu and must never hold d.tokenMu across
+// network or state-store I/O so concurrent readers never block or deadlock.
+func (d *Driver) refreshDirectLocked(ctx context.Context) error {
+	_, refreshToken, _ := d.tokenStateSnapshot()
+	if refreshToken == "" {
 		return fmt.Errorf("baidu_netdisk: refresh_token is required")
 	}
 	var resp tokenResp
@@ -377,7 +449,7 @@ func (d *Driver) refreshDirect(ctx context.Context) error {
 			return err
 		}
 		query := u.Query()
-		query.Set("refresh_ui", d.refreshToken)
+		query.Set("refresh_ui", refreshToken)
 		query.Set("server_use", "true")
 		query.Set("driver_txt", "baiduyun_go")
 		u.RawQuery = query.Encode()
@@ -387,7 +459,7 @@ func (d *Driver) refreshDirect(ctx context.Context) error {
 	} else {
 		form := url.Values{}
 		form.Set("grant_type", "refresh_token")
-		form.Set("refresh_token", d.refreshToken)
+		form.Set("refresh_token", refreshToken)
 		form.Set("client_id", d.clientID)
 		form.Set("client_secret", d.clientSecret)
 		if err := d.requestToken(ctx, http.MethodGet, d.oauthURL+"?"+form.Encode(), nil, &resp); err != nil {
@@ -409,19 +481,31 @@ func (d *Driver) refreshDirect(ctx context.Context) error {
 		}
 		return fmt.Errorf("baidu_netdisk: refresh token returned empty token")
 	}
+	expires := time.Now().Add(time.Hour)
+	if resp.ExpiresIn > 0 {
+		expires = time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second)
+	}
+	updated := time.Now()
+	d.tokenMu.Lock()
 	d.accessToken = resp.AccessToken
 	d.refreshToken = resp.RefreshToken
-	if resp.ExpiresIn > 0 {
-		d.tokenExpires = time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second)
-	} else {
-		d.tokenExpires = time.Now().Add(time.Hour)
-	}
+	d.tokenExpires = expires
 	d.tokenSource = "refresh"
-	d.tokenUpdated = time.Now()
+	d.tokenUpdated = updated
+	state := tokenState{
+		AccessToken:        d.accessToken,
+		RefreshToken:       d.refreshToken,
+		ExpiresAt:          d.tokenExpires,
+		Account:            d.account,
+		ConfigRefreshToken: d.configRefreshToken,
+		UpdatedAt:          d.tokenUpdated,
+	}
+	d.tokenMu.Unlock()
+
 	if d.cred.Session() != nil {
 		return nil
 	}
-	if err := d.saveTokenState(); err != nil {
+	if err := d.saveTokenStateSnapshot(state); err != nil {
 		return fmt.Errorf("baidu_netdisk: save token state: %w", err)
 	}
 	return nil
@@ -429,8 +513,9 @@ func (d *Driver) refreshDirect(ctx context.Context) error {
 
 // refreshShared coalesces refreshes across every mount sharing the credential.
 // The session's refresh token is authoritative so a rotated chain is not lost.
-func (d *Driver) refreshShared(ctx context.Context) error {
+func (d *Driver) refreshShared(ctx context.Context, force bool, failedToken string) error {
 	_, err := d.cred.Refresh(ctx, func(value credentialPayload, current drive.CredentialSnapshot) ([]byte, string, error) {
+		d.tokenMu.Lock()
 		if value.RefreshToken != "" {
 			d.refreshToken = value.RefreshToken
 		}
@@ -438,18 +523,24 @@ func (d *Driver) refreshShared(ctx context.Context) error {
 			d.accessToken = value.AccessToken
 			d.tokenExpires = value.ExpiresAt
 		}
-		if d.accessToken != "" && !d.tokenExpires.IsZero() && time.Now().Before(d.tokenExpires.Add(-defaultTokenSkew)) {
-			return current.Payload, d.account, nil
+		access := d.accessToken
+		expires := d.tokenExpires
+		account := d.account
+		d.tokenMu.Unlock()
+
+		if canReuseToken(access, expires, force, failedToken) {
+			return current.Payload, account, nil
 		}
 		if refreshErr := d.refreshDirect(ctx); refreshErr != nil {
 			return nil, "", refreshErr
 		}
+		access, refresh, expires, account := d.credentialState()
 		encoded, _, encodeErr := encodeCredentialPayload(credentialPayload{
-			AccessToken:  d.accessToken,
-			RefreshToken: d.refreshToken,
-			ExpiresAt:    d.tokenExpires,
+			AccessToken:  access,
+			RefreshToken: refresh,
+			ExpiresAt:    expires,
 		})
-		return encoded, d.account, encodeErr
+		return encoded, account, encodeErr
 	})
 	return err
 }
@@ -469,6 +560,7 @@ func (d *Driver) applyCredentialBinding(value credentialPayload, snapshot drive.
 	if value.AccessToken == "" && value.RefreshToken == "" {
 		return false
 	}
+	d.tokenMu.Lock()
 	d.accessToken = value.AccessToken
 	d.refreshToken = value.RefreshToken
 	d.tokenExpires = value.ExpiresAt
@@ -477,6 +569,7 @@ func (d *Driver) applyCredentialBinding(value credentialPayload, snapshot drive.
 	if snapshot.Account != "" {
 		d.account = snapshot.Account
 	}
+	d.tokenMu.Unlock()
 	return true
 }
 
@@ -513,13 +606,19 @@ func (d *Driver) loadAccount(ctx context.Context) {
 		logging.L.Warnf("[baidu_netdisk] fetch account: %v", err)
 		return
 	}
+	var account string
 	switch {
 	case resp.NetdiskName != "":
-		d.account = resp.NetdiskName
+		account = resp.NetdiskName
 	case resp.BaiduName != "":
-		d.account = resp.BaiduName
+		account = resp.BaiduName
 	case resp.UK != 0:
-		d.account = strconv.FormatInt(resp.UK, 10)
+		account = strconv.FormatInt(resp.UK, 10)
+	}
+	if account != "" {
+		d.tokenMu.Lock()
+		d.account = account
+		d.tokenMu.Unlock()
 	}
 }
 
@@ -539,6 +638,7 @@ func (d *Driver) loadTokenState() {
 	// rotation) or when it predates the source marker. A config token that
 	// differs from the token the state was derived from is an account switch.
 	stateDerived := state.ConfigRefreshToken == "" || state.ConfigRefreshToken == d.configRefreshToken
+	d.tokenMu.Lock()
 	if state.RefreshToken != "" && stateDerived {
 		d.refreshToken = state.RefreshToken
 		d.tokenSource = "state"
@@ -553,20 +653,14 @@ func (d *Driver) loadTokenState() {
 	if state.Account != "" {
 		d.account = state.Account
 	}
+	d.tokenMu.Unlock()
 }
 
-func (d *Driver) saveTokenState() error {
+func (d *Driver) saveTokenStateSnapshot(state tokenState) error {
 	if d.stateStore == nil {
 		return nil
 	}
-	return d.stateStore.SaveJSON("baidu_netdisk_token.json", tokenState{
-		AccessToken:        d.accessToken,
-		RefreshToken:       d.refreshToken,
-		ExpiresAt:          d.tokenExpires,
-		Account:            d.account,
-		ConfigRefreshToken: d.configRefreshToken,
-		UpdatedAt:          d.tokenUpdated,
-	})
+	return d.stateStore.SaveJSON("baidu_netdisk_token.json", state)
 }
 
 func (d *Driver) requestToken(ctx context.Context, method, rawURL string, body io.Reader, out any) error {

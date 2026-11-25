@@ -3,6 +3,7 @@ package baidunetdisk
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,23 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 )
 
+type downloadStatusError struct {
+	stage  string
+	status int
+}
+
+func (e *downloadStatusError) Error() string {
+	return fmt.Sprintf("baidu_netdisk: %s status %d", e.stage, e.status)
+}
+
+func isAuthStatusError(err error) bool {
+	var statusErr *downloadStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	return statusErr.status == http.StatusUnauthorized || statusErr.status == http.StatusForbidden
+}
+
 func (d *Driver) Read(ctx context.Context, entry drive.Entry, offset, size int64) (io.ReadCloser, error) {
 	if offset < 0 || size < 0 {
 		return nil, fmt.Errorf("baidu_netdisk: read: negative offset or size")
@@ -21,48 +39,71 @@ func (d *Driver) Read(ctx context.Context, entry drive.Entry, offset, size int64
 	if entry.Size > 0 && offset >= entry.Size {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	u, err := d.downloadURL(ctx, entry)
-	if err != nil {
-		d.setLastError(err)
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", d.downloadUA)
-	if offset > 0 || size > 0 {
-		end := ""
-		if size > 0 {
-			endOffset := offset + size - 1
-			if entry.Size > 0 && endOffset >= entry.Size {
-				endOffset = entry.Size - 1
+	for attempt := range 2 {
+		usedToken := d.currentAccessToken()
+		u, err := d.downloadURL(ctx, entry)
+		if err != nil {
+			if attempt == 0 && ctx.Err() == nil && isAuthStatusError(err) {
+				d.downloadCache.Delete(entry.ID)
+				_ = d.refreshForced(ctx, usedToken)
+				continue
 			}
-			end = strconv.FormatInt(endOffset, 10)
+			d.setLastError(err)
+			return nil, err
 		}
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%s", offset, end))
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", d.downloadUA)
+		if offset > 0 || size > 0 {
+			end := ""
+			if size > 0 {
+				endOffset := offset + size - 1
+				if entry.Size > 0 && endOffset >= entry.Size {
+					endOffset = entry.Size - 1
+				}
+				end = strconv.FormatInt(endOffset, 10)
+			}
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%s", offset, end))
+		}
+		start := time.Now()
+		resp, err := d.downloadClient.Do(req)
+		d.recordHTTP(ctx, "download", req, resp, start, map[string]any{"range": req.Header.Get("Range")}, err)
+		if err != nil {
+			d.downloadCache.Delete(entry.ID)
+			if attempt == 0 && ctx.Err() == nil {
+				continue
+			}
+			err = fmt.Errorf("baidu_netdisk: read: %w", err)
+			d.setLastError(err)
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && entry.Size > 0 && offset >= entry.Size {
+			resp.Body.Close()
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		}
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			d.downloadCache.Delete(entry.ID)
+			if attempt == 0 && ctx.Err() == nil {
+				_ = d.refreshForced(ctx, usedToken)
+				continue
+			}
+			err := &downloadStatusError{stage: "read", status: resp.StatusCode}
+			d.setLastError(err)
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			resp.Body.Close()
+			d.downloadCache.Delete(entry.ID)
+			err := &downloadStatusError{stage: "read", status: resp.StatusCode}
+			d.setLastError(err)
+			return nil, err
+		}
+		return d.limiter.LimitDownload(ctx, resp.Body), nil
 	}
-	start := time.Now()
-	resp, err := d.httpClient.Do(req)
-	d.recordHTTP(ctx, "download", req, resp, start, map[string]any{"range": req.Header.Get("Range")}, err)
-	if err != nil {
-		d.downloadCache.Delete(entry.ID)
-		err = fmt.Errorf("baidu_netdisk: read: %w", err)
-		d.setLastError(err)
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && entry.Size > 0 && offset >= entry.Size {
-		resp.Body.Close()
-		return io.NopCloser(bytes.NewReader(nil)), nil
-	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		resp.Body.Close()
-		d.downloadCache.Delete(entry.ID)
-		err := fmt.Errorf("baidu_netdisk: read status %d", resp.StatusCode)
-		d.setLastError(err)
-		return nil, err
-	}
-	return d.limiter.LimitDownload(ctx, resp.Body), nil
+	return nil, fmt.Errorf("baidu_netdisk: read failed")
 }
 
 func (d *Driver) downloadURL(ctx context.Context, entry drive.Entry) (string, error) {
@@ -88,10 +129,11 @@ func (d *Driver) downloadURL(ctx context.Context, entry drive.Entry) (string, er
 		return "", fmt.Errorf("baidu_netdisk: download url is empty")
 	}
 	dlink := resp.List[0].Dlink
+	accessToken := d.currentAccessToken()
 	if strings.Contains(dlink, "?") {
-		dlink += "&access_token=" + url.QueryEscape(d.accessToken)
+		dlink += "&access_token=" + url.QueryEscape(accessToken)
 	} else {
-		dlink += "?access_token=" + url.QueryEscape(d.accessToken)
+		dlink += "?access_token=" + url.QueryEscape(accessToken)
 	}
 	redirectURL, err := d.resolveDownloadRedirect(ctx, dlink)
 	if err != nil {
@@ -102,33 +144,59 @@ func (d *Driver) downloadURL(ctx context.Context, entry drive.Entry) (string, er
 }
 
 func (d *Driver) resolveDownloadRedirect(ctx context.Context, u string) (string, error) {
-	client := *d.httpClient
+	client := *d.downloadClient
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u, nil)
+	location, status, err := d.probeDownloadRedirect(ctx, &client, http.MethodHead, u, "")
 	if err != nil {
 		return "", err
 	}
+	if location != "" {
+		return location, nil
+	}
+	if status >= 200 && status < 300 {
+		return u, nil
+	}
+	if status == http.StatusForbidden || status == http.StatusMethodNotAllowed {
+		location, status, err = d.probeDownloadRedirect(ctx, &client, http.MethodGet, u, "bytes=0-0")
+		if err != nil {
+			return "", err
+		}
+		if location != "" {
+			return location, nil
+		}
+		if status == http.StatusOK || status == http.StatusPartialContent {
+			return u, nil
+		}
+	}
+	return "", &downloadStatusError{stage: "download redirect", status: status}
+}
+
+func (d *Driver) probeDownloadRedirect(ctx context.Context, client *http.Client, method, u, rangeHeader string) (string, int, error) {
+	req, err := http.NewRequestWithContext(ctx, method, u, nil)
+	if err != nil {
+		return "", 0, err
+	}
 	req.Header.Set("User-Agent", d.downloadUA)
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
 	start := time.Now()
 	resp, err := client.Do(req)
 	d.recordHTTP(ctx, "resolve_download_redirect", req, resp, start, nil, err)
 	if err != nil {
-		return "", fmt.Errorf("baidu_netdisk: download redirect: %w", err)
+		return "", 0, fmt.Errorf("baidu_netdisk: download redirect: %w", err)
 	}
-	defer resp.Body.Close()
 	location := resp.Header.Get("Location")
-	if location == "" {
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return u, nil
+	status := resp.StatusCode
+	if location != "" {
+		if parsed, err := url.Parse(location); err == nil && !parsed.IsAbs() {
+			location = resp.Request.URL.ResolveReference(parsed).String()
 		}
-		return "", fmt.Errorf("baidu_netdisk: download redirect status %d", resp.StatusCode)
 	}
-	if parsed, err := url.Parse(location); err == nil && !parsed.IsAbs() {
-		location = resp.Request.URL.ResolveReference(parsed).String()
-	}
-	return location, nil
+	resp.Body.Close()
+	return location, status, nil
 }
 
 func (d *Driver) RemoteHash(_ context.Context, entry drive.Entry) (drive.HashAlgorithm, string, error) {
