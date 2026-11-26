@@ -18,7 +18,11 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/util"
 )
 
-const attachPollInterval = 2 * time.Second
+const (
+	attachPollInterval    = 2 * time.Second
+	attachPollTimeout     = 10 * time.Second
+	attachMaxPollFailures = 3
+)
 
 type attachMountClient interface {
 	ListMounts(ctx context.Context) ([]control.MountStatus, error)
@@ -96,20 +100,34 @@ func watchAttachedMount(ctx context.Context, client attachMountClient, id, mount
 	}
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	consecutiveErrors := 0
 	for {
 		select {
 		case <-ctx.Done():
 			detach()
 			return nil
 		case <-ticker.C:
-			listCtx, cancelList := context.WithTimeout(context.Background(), 5*time.Second)
+			listCtx, cancelList := context.WithTimeout(ctx, attachPollTimeout)
 			mounts, err := client.ListMounts(listCtx)
 			cancelList()
 			if err != nil {
-				logging.L.Warnf("Mount stopped unexpectedly: %v", err)
+				if ctx.Err() != nil {
+					detach()
+					return nil
+				}
+				consecutiveErrors++
+				if closer, ok := client.(interface{ CloseIdleConnections() }); ok {
+					closer.CloseIdleConnections()
+				}
+				if consecutiveErrors < attachMaxPollFailures {
+					logging.L.Warnf("Mount status poll failed (%d/%d), retrying: %v", consecutiveErrors, attachMaxPollFailures, err)
+					continue
+				}
+				logging.L.Warnf("Mount stopped unexpectedly after %d failed polls: %v", consecutiveErrors, err)
 				detach()
 				return fmt.Errorf("%s: %w", mountPoint, errMountSessionEnded)
 			}
+			consecutiveErrors = 0
 			found := false
 			for _, hosted := range mounts {
 				if hosted.ID == id {

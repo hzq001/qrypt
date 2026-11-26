@@ -14,15 +14,26 @@ import (
 )
 
 type fakeAttachClient struct {
-	mounts       []control.MountStatus
-	listErr      error
-	outcome      control.MountOutcome
-	outcomeErr   error
-	outcomeCalls int
+	mounts         []control.MountStatus
+	listErr        error
+	listFunc       func(context.Context) ([]control.MountStatus, error)
+	listCalls      int
+	closeIdleCalls int
+	outcome        control.MountOutcome
+	outcomeErr     error
+	outcomeCalls   int
 }
 
-func (c *fakeAttachClient) ListMounts(context.Context) ([]control.MountStatus, error) {
+func (c *fakeAttachClient) ListMounts(ctx context.Context) ([]control.MountStatus, error) {
+	c.listCalls++
+	if c.listFunc != nil {
+		return c.listFunc(ctx)
+	}
 	return c.mounts, c.listErr
+}
+
+func (c *fakeAttachClient) CloseIdleConnections() {
+	c.closeIdleCalls++
 }
 
 func (c *fakeAttachClient) MountOutcome(context.Context, string) (control.MountOutcome, error) {
@@ -225,5 +236,128 @@ func TestWatchAttachedMountWithControlClient(t *testing.T) {
 				t.Fatalf("%s reason error = %v, want nil", reason, gotErr)
 			}
 		})
+	}
+}
+
+func TestWatchAttachedMountRetriesTransientPollErrors(t *testing.T) {
+	t.Parallel()
+	var calls int
+	client := &fakeAttachClient{
+		outcome: control.MountOutcome{ID: "m1", Active: false, Reason: "detached"},
+	}
+	client.listFunc = func(context.Context) ([]control.MountStatus, error) {
+		calls++
+		switch calls {
+		case 1, 2:
+			return nil, context.DeadlineExceeded
+		case 3:
+			return []control.MountStatus{{ID: "m1"}}, nil
+		default:
+			return nil, nil
+		}
+	}
+
+	var errBuf bytes.Buffer
+	detached := false
+	consumed := false
+	err := watchAttachedMount(
+		context.Background(),
+		client,
+		"m1",
+		"/mnt/qrypt",
+		5*time.Millisecond,
+		func() { detached = true },
+		func() { consumed = true },
+		&errBuf,
+	)
+	if err != nil {
+		t.Fatalf("watchAttachedMount() = %v, want nil", err)
+	}
+	if detached {
+		t.Fatal("detach was unexpectedly called on transient poll errors")
+	}
+	if !consumed {
+		t.Fatal("detach was not consumed on clean detach outcome")
+	}
+	if client.listCalls != 4 {
+		t.Fatalf("listCalls = %d, want 4", client.listCalls)
+	}
+	if client.closeIdleCalls != 2 {
+		t.Fatalf("closeIdleCalls = %d, want 2", client.closeIdleCalls)
+	}
+}
+
+func TestWatchAttachedMountResetsFailureCountAfterSuccess(t *testing.T) {
+	t.Parallel()
+	var calls int
+	client := &fakeAttachClient{
+		outcome: control.MountOutcome{ID: "m1", Active: false, Reason: "detached"},
+	}
+	client.listFunc = func(context.Context) ([]control.MountStatus, error) {
+		calls++
+		switch calls {
+		case 1, 2, 4, 5:
+			return nil, context.DeadlineExceeded
+		case 3, 6:
+			return []control.MountStatus{{ID: "m1"}}, nil
+		default:
+			return nil, nil
+		}
+	}
+
+	var errBuf bytes.Buffer
+	detached := false
+	consumed := false
+	err := watchAttachedMount(
+		context.Background(),
+		client,
+		"m1",
+		"/mnt/qrypt",
+		5*time.Millisecond,
+		func() { detached = true },
+		func() { consumed = true },
+		&errBuf,
+	)
+	if err != nil {
+		t.Fatalf("watchAttachedMount() = %v, want nil", err)
+	}
+	if detached {
+		t.Fatal("detach was unexpectedly called when poll failures were non-consecutive")
+	}
+	if !consumed {
+		t.Fatal("detach was not consumed on clean detach outcome")
+	}
+	if client.closeIdleCalls != 4 {
+		t.Fatalf("closeIdleCalls = %d, want 4", client.closeIdleCalls)
+	}
+}
+
+func TestWatchAttachedMountDetachesCleanlyWhenCanceledDuringPollError(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &fakeAttachClient{
+		listFunc: func(context.Context) ([]control.MountStatus, error) {
+			cancel()
+			return nil, context.DeadlineExceeded
+		},
+	}
+
+	var errBuf bytes.Buffer
+	detached := false
+	err := watchAttachedMount(
+		ctx,
+		client,
+		"m1",
+		"/mnt/qrypt",
+		5*time.Millisecond,
+		func() { detached = true },
+		func() {},
+		&errBuf,
+	)
+	if err != nil {
+		t.Fatalf("watchAttachedMount() = %v, want nil on context cancel", err)
+	}
+	if !detached {
+		t.Fatal("detach was not called when canceled during poll error")
 	}
 }
