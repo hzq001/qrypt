@@ -76,8 +76,10 @@ cmd_install() {
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>30</integer>
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Interactive</string>
 	<key>StandardOutPath</key>
 	<string>$LOG_DIR/launchd.out.log</string>
 	<key>StandardErrorPath</key>

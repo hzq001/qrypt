@@ -29,7 +29,8 @@ ls ~/Qrypt/local
 | `RunAtLoad` | `true` | 登录后立刻启动 |
 | `KeepAlive` | `SuccessfulExit=false` | 只有非零退出才重启；`Ctrl+C`、服务停止或用户主动推出卷（退出码 0）不会被拉起 |
 | `ThrottleInterval` | `30` | 反复失败时最小重启间隔 30 秒 |
-| `ProcessType` | `Background` | 不与应用争抢前台调度 |
+| `ExitTimeOut` | `30` | 停止或注销时给 `qrypt mount --stop-core` 最长 30 秒完成干净卸载与 Core 关闭，避免默认 5 秒超时被强杀 |
+| `ProcessType` | `Interactive` | 保持正常交互调度优先级，避免 FUSE 文件系统回调被 macOS 后台限流或唤醒卡顿 |
 | `StandardOutPath` / `StandardErrorPath` | `~/.qrypt/logs/launchd.{out,err}.log` | launchd 捕获的标准输出与错误 |
 
 LaunchAgent 属于用户登录会话，因此是**登录后**自动挂载。plist 放在 `~/Library/LaunchAgents` 即生效，不需要 `sudo`。
